@@ -29,8 +29,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-VERSION = "0.1.4"
-CONTRACT = "wizard.ai-connection/1"
+# Also supports the existing isolated (-I) launch used by the test harness.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import inference
+
+VERSION = "0.2.0"
+CONTRACT = "wizard.ai-connection/2"
 APP = Path(__file__).resolve().parent
 BIND = os.environ.get("WIZARD_CHATGPT_BIND", "0.0.0.0")
 PORT = int(os.environ.get("WIZARD_CHATGPT_PORT", "8801"))
@@ -79,7 +83,7 @@ class Hermes:
     @classmethod
     def _login(cls):
         jar = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), inference.NoRedirect(), urllib.request.HTTPCookieProcessor(jar))
         body = json.dumps({"provider": "basic", "username": HERMES_USER, "password": HERMES_PASSWORD}).encode()
         req = urllib.request.Request(HERMES_URL + "/auth/password-login", data=body, method="POST",
                                      headers={"Content-Type": "application/json"})
@@ -110,6 +114,9 @@ class Hermes:
                 with opener.open(req, timeout=timeout) as res:
                     return json.loads(res.read() or b"{}")
             except urllib.error.HTTPError as e:
+                if e.code == 404 and path == inference.MODELS_PATH:
+                    e.close()
+                    raise HermesError(inference.REQUIRED) from None
                 if e.code == 401 and attempt == 0:   # the dashboard session expired: sign in once more
                     with cls.lock:
                         cls.opener = None
@@ -192,6 +199,13 @@ def connection(fresh: bool = False) -> dict:
         out["error"] = {"code": "signed_out", "message": "ChatGPT is not connected. Open the ChatGPT app and press Connect."}
     elif s["status"] == "error":
         out["error"] = {"code": s.get("code") or "provider_error", "message": s.get("detail") or "Something is wrong."}
+    try:
+        out["models"] = inference.models(Hermes)
+    except (HermesError, inference.Fault) as e:
+        out["models"] = []
+        # Preserve /1 status/usage; model discovery failure never invents availability.
+        if out["error"] is None:
+            out["models_error"] = {"code": e.code, "message": str(e)}
     with Cache.lock:
         Cache.value, Cache.at = out, time.monotonic()
     return out
@@ -347,7 +361,8 @@ def card(host: str) -> dict:
             "connection_api": f"{base}/api/connection",
             "agent_dashboard": "configured" if Hermes.configured() else "missing",
             "usage": "from the agent's dashboard (Wizard OS plugin route) when present",
-            "ai_calls": False,
+            "ai_calls": True,
+            "inference_api": "router-only /api/infer (Hermes wizard-os >=0.4.0)",
             "secrets_exposed": False,
         },
     }
@@ -382,6 +397,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send(code, json.dumps(data).encode(), "application/json")
 
     def authorized(self, path: str) -> bool:
+        if path == "/api/connection" and self.headers.get("X-Wizard-Grant"):
+            try:
+                if inference.admit(self.headers):
+                    return True
+            except inference.Fault as e:
+                self.json(e.status, e.payload())
+                return False
         if not PASSWORD or path == "/health":
             return True
         header = self.headers.get("Authorization", "")
@@ -426,6 +448,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlsplit(self.path).path
+        if path == "/api/infer":
+            return inference.handle(self, Hermes, HERMES_URL)
         if not self.authorized(path):
             return
         origin = self.headers.get("Origin")

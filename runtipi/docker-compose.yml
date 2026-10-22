@@ -12,7 +12,7 @@ services:
     mem_limit: 128m
     environment:
       WIZARD_APP: wizard-chatgpt
-      APP_VERSION: 0.1.4
+      APP_VERSION: 0.2.0
       FRONT_PORT: "8801"
       UPSTREAM_HOST: wizard-chatgpt-engine
       UPSTREAM_PORT: "8801"

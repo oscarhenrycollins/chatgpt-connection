@@ -11,7 +11,7 @@
   ],
   "description": "Connect your ChatGPT Plus or Pro subscription to your Wizard server once. The sign-in is your Hermes Agent's own ChatGPT login (a short code you approve on ChatGPT), so Hermes keeps and renews it and this app never sees it. The app shows whether ChatGPT is connected and reports that to Wizard's Resources screen; usage numbers there come from the agent's own sign-in. Needs the Hermes Agent app from Wizard Apps.",
   "tipi_version": 1,
-  "version": "0.1.4",
+  "version": "0.2.0",
   "source": "https://github.com/oscarhenrycollins/chatgpt-connection",
   "exposable": false,
   "supported_architectures": [

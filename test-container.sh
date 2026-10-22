@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build the image, then prove inside it (read-only, no capabilities, uid 1000): the file list, health,
-# the page, the card, the wizard.ai-connection/1 answer with no agent dashboard (error / unreachable,
+# the page, the card, the wizard.ai-connection/2 answer with no agent dashboard (error / unreachable,
 # usage null), box-only refusals, no credential surface, cross-site refusal, and a clean SIGTERM exit.
 # The device-code flow itself is covered by test-chatgpt.py against a stand-in dashboard.
 set -eu
@@ -12,7 +12,7 @@ docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges --me
 import json, os, pathlib, subprocess, sys, time, urllib.request, urllib.error
 assert os.getuid() == 1000 and os.getgid() == 1000, "must run as 1000:1000"
 files = sorted(str(p.relative_to("/app")) for p in pathlib.Path("/app").rglob("*") if p.is_file())
-assert files == ["LICENSE", "SKILL.md", "server.py", "static/app.css", "static/app.js", "static/index.html"], files
+assert files == ["LICENSE", "SKILL.md", "inference.py", "server.py", "static/app.css", "static/app.js", "static/index.html"], files
 p = subprocess.Popen([sys.executable, "/app/server.py"])
 B = "http://127.0.0.1:8801"
 def req(path, body=None, headers=None):
@@ -29,17 +29,17 @@ while time.monotonic() - t0 < 10:
     try:
         code, body = req("/health"); break
     except OSError: time.sleep(0.1)
-assert json.loads(body) == {"status": "ok", "version": "0.1.4"}, body
+assert json.loads(body) == {"status": "ok", "version": "0.2.0"}, body
 code, body = req("/"); assert code == 200 and b"<title>ChatGPT</title>" in body
 h = urllib.request.urlopen(B + "/", timeout=30).headers
 assert h["Content-Security-Policy"].split("frame-ancestors ")[1].startswith(chr(39) + "self" + chr(39) + ";") and h["X-Frame-Options"] == "SAMEORIGIN", dict(h)
 for f in ("/app.js", "/app.css", "/SKILL.md"): assert req(f)[0] == 200, f
 cardj = json.loads(req("/.well-known/mcp/server-cards.json")[1])
 assert cardj["name"] == "wizard-chatgpt" and cardj["x-wizard"]["provides"] == ["ai-connection", "chatgpt-subscription"], cardj
-assert cardj["x-wizard"]["contract"] == "wizard.ai-connection/1" and cardj["x-wizard"]["agent_dashboard"] == "missing", cardj
+assert cardj["x-wizard"]["contract"] == "wizard.ai-connection/2" and cardj["x-wizard"]["agent_dashboard"] == "missing", cardj
 code, body = req("/api/connection"); conn = json.loads(body)
-assert code == 200 and list(conn) == ["contract", "provider", "name", "status", "plan", "account", "usage", "error"], conn
-assert conn["contract"] == "wizard.ai-connection/1" and conn["provider"] == "chatgpt" and conn["status"] == "error", conn
+assert code == 200 and list(conn) == ["contract", "provider", "name", "status", "plan", "account", "usage", "error", "models"], conn
+assert conn["contract"] == "wizard.ai-connection/2" and conn["provider"] == "chatgpt" and conn["status"] == "error", conn
 assert conn["usage"] is None and conn["error"]["code"] == "unreachable" and "Hermes Agent" in conn["error"]["message"], conn
 for h in ({"Tailscale-User-Login": "x@y"}, {"X-Forwarded-For": "1.2.3.4"}, {"Forwarded": "for=1.2.3.4"},
           {"X-Real-IP": "1.2.3.4"}, {"CF-Connecting-IP": "1.2.3.4"}, {"cf-ray": "abc"}):

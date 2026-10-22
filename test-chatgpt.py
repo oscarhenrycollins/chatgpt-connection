@@ -22,7 +22,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TOKEN = "tok-SECRET-never-shown"
-CONTRACT_KEYS = ["contract", "provider", "name", "status", "plan", "account", "usage", "error"]
+CONTRACT_KEYS = ["contract", "provider", "name", "status", "plan", "account", "usage", "error", "models"]
 
 
 class Fake:
@@ -82,6 +82,8 @@ class Stub(BaseHTTPRequestHandler):
                 "fetchedAt": "2026-10-16T04:48:23.362Z", "paid": None,
                 "limits": [{"id": "weekly:0", "label": "Weekly", "usedPercent": 6.0, "remainingPercent": 94,
                             "resetsAt": "2026-10-22T06:13:23.000Z"}]}})
+        if method == "GET" and path == "/api/plugins/wizard-os/models/chatgpt":
+            return self.reply(200, {"models": [{"id": "gpt-6.1-sol", "label": "Sol", "tier": "standard", "abilities": ["text", "streaming"]}]})
         if method == "GET" and path == "/api/model/info":
             return self.reply(200, {"provider": Fake.current, "model": "gpt-6-sol" if Fake.current == "openai-codex" else "opus"})
         if method == "GET" and path.startswith("/api/model/options"):
@@ -171,9 +173,10 @@ def main():
         # Logged out: the contract answer, signed_out, no usage.
         code, conn = req("/api/connection")
         assert code == 200 and list(conn) == CONTRACT_KEYS, conn
-        assert conn["contract"] == "wizard.ai-connection/1" and conn["provider"] == "chatgpt" and conn["name"] == "ChatGPT"
+        assert conn["contract"] == "wizard.ai-connection/2" and conn["provider"] == "chatgpt" and conn["name"] == "ChatGPT"
         assert conn["status"] == "not_connected" and conn["usage"] is None and conn["plan"] is None
         assert conn["error"]["code"] == "signed_out", conn
+        assert conn["models"][0]["id"] == "gpt-6.1-sol"
         assert row()["status"] == "not_connected"
 
         # Box-only: every proxy header is refused, the page stays open.
