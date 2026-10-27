@@ -13,7 +13,7 @@ services:
     mem_limit: 128m
     environment:
       WIZARD_APP: wizard-chatgpt
-      APP_VERSION: 0.2.5
+      APP_VERSION: 0.2.6
       FRONT_PORT: "8801"
       UPSTREAM_HOST: wizard-chatgpt-engine
       UPSTREAM_PORT: "8800"
@@ -252,7 +252,7 @@ services:
       internal_port: 8801
   wizard-chatgpt-engine:
     # Built and published by wizard-app-store images/wizard-chatgpt at 254ee6f2 (wizard-app-store #32), Build ChatGPT run 40364246353.
-    image: ghcr.io/humanitylabs-org/wizard-chatgpt:0.2.5@sha256:d0ae481a924bef58978ba382e10e65e1e558d6a98a1830841e9d6242d94a09e9
+    image: ghcr.io/humanitylabs-org/wizard-chatgpt:0.2.6@sha256:72be4ede5a2e0151eea3a9050611352b0b14c044e56c1202a25442f4003552e3
     user: "1000:1000"
     read_only: true
     cap_drop: [ALL]
