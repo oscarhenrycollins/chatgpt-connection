@@ -5,7 +5,7 @@ name: ChatGPT
 type: external
 category: system
 tags: [security]
-version: 0.2.6
+version: 0.2.7
 summary: Connect one or more ChatGPT subscriptions; your agent uses them, and you see how much each has left.
 icon: icon.png
 license: MIT

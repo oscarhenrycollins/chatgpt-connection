@@ -13,7 +13,7 @@ services:
     mem_limit: 128m
     environment:
       WIZARD_APP: wizard-chatgpt
-      APP_VERSION: 0.2.6
+      APP_VERSION: 0.2.7
       FRONT_PORT: "8801"
       UPSTREAM_HOST: wizard-chatgpt-engine
       UPSTREAM_PORT: "8800"
@@ -229,18 +229,18 @@ services:
           d = json.loads(raw)
           code = (d.get("error") or {}).get("code")
           if d.get("status") == "not_connected":
-              d["next"] = ("Ask the owner to open the ChatGPT app and press Sign in. ChatGPT first needs Settings -> Security -> "
+              d["next"] = ("Ask the owner to open the ChatGPT app and press Connect (or Add account). ChatGPT first needs Settings -> Security -> "
                            "Device code sign-in for Codex turned on; then he copies the code, opens the sign-in link and pastes it. "
                            "Never ask for the code or a token in chat.")
           elif d.get("status") == "expired":
-              d["next"] = "Ask the owner to open the ChatGPT app and press Reconnect on the expired subscription."
+              d["next"] = "Ask the owner to open the ChatGPT app and tap the expired account's row and press Reconnect."
           elif code in ("unreachable", "not_configured", "login_rejected"):
               d["next"] = ("The ChatGPT app can't reach this agent's dashboard (error.message; the page shows the agent address). "
                            "On a box where Wizard runs next to your own Hermes, run `wam alongside` and then any `wam app update ...` "
                            "it prints (re-points the app at this agent and restarts it); otherwise `wam app update wizard-chatgpt`. "
                            "Check again; tell the owner in plain words if it still fails.")
           elif code == "limit":
-              d["next"] = "That subscription hit its limit; the owner can add another ChatGPT subscription with + Add in the ChatGPT app."
+              d["next"] = "That subscription hit its limit; the owner can add another ChatGPT subscription with Add account in the ChatGPT app."
           return d
 
 
@@ -252,7 +252,7 @@ services:
       internal_port: 8801
   wizard-chatgpt-engine:
     # Built and published by wizard-app-store images/wizard-chatgpt at 254ee6f2 (wizard-app-store #32), Build ChatGPT run 40364246353.
-    image: ghcr.io/humanitylabs-org/wizard-chatgpt:0.2.6@sha256:72be4ede5a2e0151eea3a9050611352b0b14c044e56c1202a25442f4003552e3
+    image: ghcr.io/humanitylabs-org/wizard-chatgpt:0.2.7@sha256:2d838c1cbf0debc4ebc5f76837d4d6742555e1fe84c0019bf7e1c468c4c3f9c3
     user: "1000:1000"
     read_only: true
     cap_drop: [ALL]

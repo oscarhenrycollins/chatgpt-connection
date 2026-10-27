@@ -23,16 +23,16 @@ def connection_status():
     d = json.loads(raw)
     code = (d.get("error") or {}).get("code")
     if d.get("status") == "not_connected":
-        d["next"] = ("Ask the owner to open the ChatGPT app and press Sign in. ChatGPT first needs Settings -> Security -> "
+        d["next"] = ("Ask the owner to open the ChatGPT app and press Connect (or Add account). ChatGPT first needs Settings -> Security -> "
                      "Device code sign-in for Codex turned on; then he copies the code, opens the sign-in link and pastes it. "
                      "Never ask for the code or a token in chat.")
     elif d.get("status") == "expired":
-        d["next"] = "Ask the owner to open the ChatGPT app and press Reconnect on the expired subscription."
+        d["next"] = "Ask the owner to open the ChatGPT app and tap the expired account's row and press Reconnect."
     elif code in ("unreachable", "not_configured", "login_rejected"):
         d["next"] = ("The ChatGPT app can't reach this agent's dashboard (error.message; the page shows the agent address). "
                      "On a box where Wizard runs next to your own Hermes, run `wam alongside` and then any `wam app update ...` "
                      "it prints (re-points the app at this agent and restarts it); otherwise `wam app update wizard-chatgpt`. "
                      "Check again; tell the owner in plain words if it still fails.")
     elif code == "limit":
-        d["next"] = "That subscription hit its limit; the owner can add another ChatGPT subscription with + Add in the ChatGPT app."
+        d["next"] = "That subscription hit its limit; the owner can add another ChatGPT subscription with Add account in the ChatGPT app."
     return d
