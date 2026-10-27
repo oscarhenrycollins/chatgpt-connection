@@ -1,0 +1,20 @@
+name: App-owned sign-in contracts
+on:
+  pull_request:
+  push:
+    branches: [feat/app-owned-multisub-login]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Offline auth, gateway, inventory and shipped page contracts
+        run: |
+          python3 test-accounts.py
+          python3 test-pool.py
+          python3 test-chatgpt.py
+          python3 test-inference.py
+          python3 mcp/inline.py --check

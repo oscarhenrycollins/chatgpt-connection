@@ -1,313 +1,485 @@
-"""ChatGPT app, end to end against a stand-in Hermes Agent dashboard (no network, no real account).
-
-Runs server.py as a subprocess pointed at a fake Hermes that speaks the same routes stock Hermes Agent's
-dashboard serves (/auth/password-login, /api/providers/oauth..., /api/model/...). Proves the
-wizard.ai-connection/1 answer (not_connected, connected with usage null, error when unreachable), the
-box-only refusal, the 60 s cache and its reset on sign-in changes, the device-code flow (connect, a 401
-re-login, approve with and without a working agent account, Use ChatGPT, disconnect, cancel, expired),
-cross-site refusal, and that no token, dashboard password, cookie or Hermes session id reaches any response.
-Usage: python3 test-chatgpt.py
-"""
+"""Offline OAuth, rotation, migration and gateway integration tests. No live credentials."""
+import base64
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import importlib.util
+import io
 import json
 import os
-import socket
-import subprocess
-import sys
+from pathlib import Path
+import shutil
+import tempfile
 import threading
 import time
-import urllib.error
-import urllib.request
+import unittest
+from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from urllib.error import HTTPError
+from urllib.parse import parse_qs
+from urllib.request import Request, urlopen
 
-HERE = Path(__file__).resolve().parent
-TOKEN = "tok-SECRET-never-shown"
-CONTRACT_KEYS = ["contract", "provider", "name", "status", "plan", "account", "usage", "error"]
-
-
-class Fake:
-    logged_in = False
-    current = "claude-subscription-directsdk-experimental"
-    current_ok = True
-    sessions: dict = {}
-    calls: list = []
-    expire_cookie_once = False
-    model_set: list = []
-    usage_route = False   # the Wizard OS plugin route (absent on an agent without the plugin)
+import codex
+import server
 
 
-class Stub(BaseHTTPRequestHandler):
-    def log_message(self, *a):
+def jwt(exp=None):
+    b64 = lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).decode().rstrip("=")
+    return b64({"alg": "none"}) + "." + b64({"exp": exp or time.time() + 3600,
+        "https://api.openai.com/auth": {"chatgpt_account_id": "FAKE-ACCOUNT-PRIVATE", "chatgpt_plan_type": "pro"}}) + ".fake"
+
+
+@contextmanager
+def serving(s):
+    t = threading.Thread(target=s.serve_forever, kwargs={"poll_interval": .01}, daemon=True)
+    t.start()
+    try:
+        yield "http://127.0.0.1:" + str(s.server_port)
+    finally:
+        s.shutdown()
+        s.server_close()
+        t.join(5)
+
+
+class Fake(BaseHTTPRequestHandler):
+    state = {}
+    def log_message(self, *args):
         pass
 
-    def reply(self, code, data, cookie=None):
-        body = json.dumps(data).encode()
-        self.send_response(code)
+    def reply(self, status, obj):
+        raw = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(raw)))
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        if cookie:
-            self.send_header("Set-Cookie", cookie)
         self.end_headers()
-        self.wfile.write(body)
-
-    def authed(self):
-        if Fake.expire_cookie_once:
-            Fake.expire_cookie_once = False
-            return False
-        return "hermes_session_at=ok" in (self.headers.get("Cookie") or "")
-
-    def body(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        return json.loads(self.rfile.read(n) or b"{}")
-
-    def route(self, method):
-        path = self.path
-        Fake.calls.append(f"{method} {path.split('?')[0]}")
-        if method == "POST" and path == "/auth/password-login":
-            b = self.body()
-            if b == {"provider": "basic", "username": "hermes", "password": "dash-pass"}:
-                return self.reply(200, {"ok": True}, "hermes_session_at=ok; Path=/; HttpOnly")
-            return self.reply(401, {"detail": "Invalid credentials"})
-        if not self.authed():
-            return self.reply(401, {"detail": "unauthenticated"})
-        if method == "GET" and path == "/api/providers/oauth":
-            st = {"logged_in": Fake.logged_in, "token_preview": TOKEN[-4:]}
-            if Fake.logged_in:
-                st["source"] = "pool:owner@example.com"
-            return self.reply(200, {"providers": [{"id": "openai-codex", "status": st}]})
-        if method == "GET" and path == "/api/plugins/wizard-os/ai-usage/chatgpt":
-            if not Fake.usage_route:
-                return self.reply(404, {"detail": "Not Found"})
-            return self.reply(200, {"ok": True, "plan": "Pro", "usage": {
-                "fetchedAt": "2026-10-16T04:48:23.362Z", "paid": None,
-                "limits": [{"id": "weekly:0", "label": "Weekly", "usedPercent": 6.0, "remainingPercent": 94,
-                            "resetsAt": "2026-10-22T06:13:23.000Z"}]}})
-        if method == "GET" and path == "/api/model/info":
-            return self.reply(200, {"provider": Fake.current, "model": "gpt-6-sol" if Fake.current == "openai-codex" else "opus"})
-        if method == "GET" and path.startswith("/api/model/options"):
-            return self.reply(200, {"providers": [
-                {"slug": "claude-subscription-directsdk-experimental", "is_current": Fake.current != "openai-codex",
-                 "authenticated": Fake.current_ok, "models": ["opus"], "featured_models": []},
-                {"slug": "openai-codex", "is_current": Fake.current == "openai-codex", "authenticated": Fake.logged_in,
-                 "models": ["gpt-6-luna", "gpt-6-sol"] if Fake.logged_in else [], "featured_models": ["gpt-6-sol"] if Fake.logged_in else []}]})
-        if method == "POST" and path == "/api/model/set":
-            b = self.body()
-            Fake.model_set.append(b)
-            Fake.current = b["provider"]
-            return self.reply(200, {"ok": True})
-        if method == "POST" and path == "/api/providers/oauth/openai-codex/start":
-            sid = f"s{len(Fake.sessions)}"
-            Fake.sessions[sid] = "pending"
-            return self.reply(200, {"session_id": sid, "flow": "device_code", "user_code": "ABCD-1234",
-                                    "verification_url": "https://auth.openai.com/codex/device", "expires_in": 900})
-        if method == "GET" and path.startswith("/api/providers/oauth/openai-codex/poll/"):
-            sid = path.rsplit("/", 1)[1]
-            if sid not in Fake.sessions:
-                return self.reply(404, {"detail": "Session not found or expired"})
-            return self.reply(200, {"session_id": sid, "status": Fake.sessions[sid]})
-        if method == "DELETE" and path.startswith("/api/providers/oauth/sessions/"):
-            Fake.sessions.pop(path.rsplit("/", 1)[1], None)
-            return self.reply(200, {"ok": True})
-        if method == "DELETE" and path == "/api/providers/oauth/openai-codex":
-            Fake.logged_in = False
-            return self.reply(200, {"ok": True, "provider": "openai-codex"})
-        return self.reply(404, {"detail": "no route"})
+        self.wfile.write(raw)
 
     def do_GET(self):
-        self.route("GET")
+        s = self.state
+        s["requests"].append((self.command, self.path, dict(self.headers), None))
+        if s["mode"] == "unauthorized":
+            return self.reply(401, {"error": "temporary backend rejection"})
+        if self.path.startswith("/backend-api/codex/models"):
+            return self.reply(200, {"models": [{"slug": "gpt-5.6-sol", "display_name": "GPT 5.6"}]})
+        if self.path == "/backend-api/wham/usage":
+            return self.reply(200, {"plan_type": "pro", "rate_limit": {"primary_window": {"used_percent": 25, "limit_window_seconds": 18000, "reset_at": 1900000000}}})
+        if self.path.endswith("rate-limit-reset-credits"):
+            return self.reply(200, {"available": 0})
+        self.reply(404, {})
 
     def do_POST(self):
-        self.route("POST")
+        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        body = parse_qs(raw.decode()) if self.headers.get("Content-Type", "").startswith("application/x-www-form-urlencoded") else json.loads(raw or b"{}")
+        s = self.state
+        with s["lock"]:
+            s["requests"].append((self.command, self.path, dict(self.headers), body))
+        if self.path == "/api/accounts/deviceauth/usercode":
+            return self.reply(200, {"user_code": "ABCD-1234", "device_auth_id": "PRIVATE-DEVICE", "interval": "3"})
+        if self.path == "/api/accounts/deviceauth/token":
+            s["polls"] += 1
+            if s["polls"] == 1:
+                return self.reply(403, {"error": "authorization_pending"})
+            return self.reply(200, {"authorization_code": "PRIVATE-CODE", "code_verifier": "PRIVATE-VERIFIER"})
+        if self.path == "/oauth/token":
+            assert body["client_id"] == [codex.CLIENT_ID]
+            if body["grant_type"] == ["authorization_code"]:
+                assert body["redirect_uri"][0].endswith("/deviceauth/callback")
+                return self.reply(200, {"access_token": jwt(), "refresh_token": s["refresh"]})
+            with s["lock"]:
+                s["refreshes"] += 1
+                if s["invalid"] or body["refresh_token"] != [s["refresh"]]:
+                    return self.reply(401 if s.get("invalid_code") else 400, {"error": {"code": s["invalid_code"]} if s.get("invalid_code") else "invalid_grant", "detail": jwt()})
+                s["refresh"] = "FAKE-ROTATED-" + str(s["refreshes"])
+            time.sleep(.04)
+            return self.reply(200, {"access_token": jwt(), "refresh_token": s["refresh"]})
+        if self.path == "/backend-api/codex/responses/compact":
+            return self.reply(200, {"object": "response.compaction", "output": [{"type": "compaction", "encrypted_content": "fake-encrypted"}], "usage": {"input_tokens": 10, "output_tokens": 2}})
+        if self.path == "/backend-api/codex/responses":
+            if s["mode"] == "error":
+                return self.reply(400, {"error": jwt(), "refresh_token": s["refresh"]})
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Set-Cookie", "private=never-forward")
+            self.send_header("x-codex-primary-used-percent", "25")
+            self.end_headers()
+            events = [{"type": "response.created", "response": {"id": "resp_fake", "object": "response", "status": "in_progress", "output": []}},
+                      {"type": "response.output_text.delta", "delta": "hello", "item_id": "msg_fake", "output_index": 0, "content_index": 0},
+                      {"type": "response.completed", "response": {"id": "resp_fake", "object": "response", "status": "completed", "model": "wrong" if s["mode"] == "mismatch" else body["model"], "output": [{"type": "message", "id": "msg_fake", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "hello", "annotations": []}]}], "usage": {"input_tokens": 4, "output_tokens": 1, "total_tokens": 5}}}]
+            for i, e in enumerate(events):
+                if i == 2 and s["mode"] == "missing":
+                    break
+                line = ("event: " + e["type"] + "\ndata: " + json.dumps(e) + "\n\n").encode()
+                self.wfile.write(line)
+                self.wfile.flush()
+                if i == 1 and s["mode"] == "slow":
+                    s["delta_sent"].set()
+                    s["continue"].wait(4)
+            return
+        self.reply(404, {})
 
-    def do_DELETE(self):
-        self.route("DELETE")
 
+class AppCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.log = io.StringIO()
+        self.out = redirect_stdout(self.log); self.out.__enter__()
+        self.err = redirect_stderr(self.log); self.err.__enter__()
+        self.state = {"lock": threading.Lock(), "requests": [], "polls": 0, "refreshes": 0,
+                      "refresh": "FAKE-INITIAL-REFRESH", "invalid": False, "mode": "ok", "delta_sent": threading.Event(), "continue": threading.Event()}
+        self.fake = type("CaseFake", (Fake,), {"state": self.state})
+        self.backend = ThreadingHTTPServer(("127.0.0.1", 0), self.fake)
+        self.bctx = serving(self.backend); self.upstream = self.bctx.__enter__()
+        self.conn = codex.Connection(Path(self.tmp.name) / "app-data", self.upstream, self.upstream + "/backend-api")
+        self.settings = patch.multiple(server, OWNER=self.conn, PASSWORD="", HERMES_PASSWORD="")
+        self.settings.start()
+        self.env = patch.dict(os.environ, {"WIZARD_GRANTS_FILE": ""})
+        self.env.start()
+        self.srv = server.Server(("127.0.0.1", 0), server.Handler)
+        self.sctx = serving(self.srv); self.base = self.sctx.__enter__()
 
-def free_port():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    def tearDown(self):
+        self.state["continue"].set()
+        self.sctx.__exit__(None, None, None); self.bctx.__exit__(None, None, None)
+        self.settings.stop(); self.env.stop()
+        self.err.__exit__(None, None, None); self.out.__exit__(None, None, None)
+        for secret in (jwt(), self.state["refresh"], "PRIVATE-DEVICE", "PRIVATE-VERIFIER", "FAKE-ACCOUNT-PRIVATE"):
+            self.assertNotIn(secret, self.log.getvalue())
+        self.tmp.cleanup()
 
-
-def start(env_extra):
-    port = free_port()
-    env = {"PATH": os.environ["PATH"], "WIZARD_CHATGPT_PORT": str(port), "WIZARD_CHATGPT_BIND": "127.0.0.1", **env_extra}
-    proc = subprocess.Popen([sys.executable, "-I", str(HERE / "server.py")], env=env)
-    base = f"http://127.0.0.1:{port}"
-    for _ in range(100):
+    def call(self, path, body=None, headers=None):
+        req = Request(self.base + path, data=None if body is None else json.dumps(body).encode(),
+                      headers={"Content-Type": "application/json", **(headers or {})})
         try:
-            urllib.request.urlopen(base + "/health", timeout=2).read()
-            break
-        except OSError:
-            time.sleep(0.1)
-    return proc, base
+            r = urlopen(req, timeout=8)
+        except HTTPError as e:
+            r = e
+        with r:
+            return r.status, r.read(), dict(r.headers)
+
+    def login(self):
+        d = self.conn.connect()
+        self.assertEqual(self.conn.poll(d["login_id"])["status"], "pending")
+        self.conn.login["next"] = 0
+        self.assertEqual(self.conn.poll(d["login_id"])["status"], "approved")
+
+    def seed(self, exp=None):
+        with self.conn.lock():
+            self.conn.atomic("connection.json", {"status": "connected", "access_token": jwt(exp), "refresh_token": self.state["refresh"], "expires_at": exp or time.time() + 3600})
+
+    def auth(self):
+        return {"Authorization": "Bearer " + self.conn.gateway_token()}
 
 
-def main():
-    stub = ThreadingHTTPServer(("127.0.0.1", 0), Stub)
-    threading.Thread(target=stub.serve_forever, daemon=True).start()
-    proc, base = start({"WIZARD_CHATGPT_HERMES_URL": f"http://127.0.0.1:{stub.server_port}",
-                        "WIZARD_CHATGPT_HERMES_USER": "hermes", "WIZARD_CHATGPT_HERMES_PASSWORD": "dash-pass"})
-    seen = []
+class OAuthTests(AppCase):
+    def test_device_exchange_ui_api_status_and_disconnect(self):
+        status, raw, _ = self.call("/api/chatgpt/connect", {}, {"X-Wizard-Request": "1"})
+        self.assertEqual(status, 200)
+        d = json.loads(raw)
+        self.assertNotIn("PRIVATE-DEVICE", raw.decode())
+        self.assertEqual(d["url"], "https://auth.openai.com/codex/device")
+        self.call("/api/chatgpt/poll", {"login_id": d["login_id"]}, {"X-Wizard-Request": "1"})
+        self.conn.login["next"] = 0
+        status, raw, _ = self.call("/api/chatgpt/poll", {"login_id": d["login_id"]}, {"X-Wizard-Request": "1"})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)["status"], "approved")
+        status, raw, _ = self.call("/api/connection")
+        d = json.loads(raw)
+        self.assertEqual((status, d["contract"], d["status"], d["plan"]), (200, "wizard.ai-connection/2", "connected", "pro"))
+        self.assertEqual(d["usage"]["limits"][0]["remainingPercent"], 75)
+        for secret in (self.conn.stored()["access_token"], self.state["refresh"], "FAKE-ACCOUNT-PRIVATE"):
+            self.assertNotIn(secret, raw.decode())
+        # The Agent Service reads this with Node's fetch, which always adds Sec-Fetch-Mode: cors.
+        self.assertEqual(self.call("/api/connection", headers={"Sec-Fetch-Mode": "cors"})[0], 200)
+        self.assertEqual(self.call("/api/connection", headers={"Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin"})[0], 403)
+        self.assertEqual(self.call("/api/chatgpt/test", {}, {"X-Wizard-Request": "1"})[0], 200)
+        self.assertEqual(self.call("/api/chatgpt/logout", {}, {"X-Wizard-Request": "1"})[0], 200)
+        self.assertEqual(self.conn.stored(), {})
+        self.assertEqual(self.call("/v1/models", headers=self.auth())[0], 401)
 
-    def req(path, body=None, headers=None):
-        h = {"Content-Type": "application/json"} if body is not None else {}
-        h.update(headers or {})
-        r = urllib.request.Request(base + path, data=None if body is None else json.dumps(body).encode(), headers=h)
-        try:
-            with urllib.request.urlopen(r, timeout=30) as res:
-                raw, code = res.read(), res.status
-        except urllib.error.HTTPError as e:
-            raw, code = e.read(), e.code
-        seen.append(raw.decode())
-        return code, json.loads(raw)
+    def test_skew_rotation_atomic_modes_and_singleflight_across_instances(self):
+        self.seed(time.time() + 60)
+        other = codex.Connection(self.conn.data, self.upstream, self.upstream + "/backend-api")
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            tokens = list(pool.map(lambda i: (self.conn if i % 2 else other).access(), range(24)))
+        self.assertEqual(len(set(tokens)), 1)
+        self.assertEqual(self.state["refreshes"], 1)
+        self.assertEqual(self.conn.stored()["refresh_token"], "FAKE-ROTATED-1")
+        self.assertEqual(self.conn.data.stat().st_mode & 0o777, 0o700)
+        for p in self.conn.data.iterdir():
+            self.assertEqual(p.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(list(self.conn.data.glob(".pending-*")))
 
-    def row():
-        return req("/api/accounts")[1]["accounts"][0]
+    def test_singleflight_between_independent_processes(self):
+        import subprocess
+        import sys
+        self.seed(time.time() + 30)
+        code = "import codex; c=codex.Connection(" + repr(str(self.conn.data)) + "," + repr(self.upstream) + "," + repr(self.upstream + "/backend-api") + "); c.access()"
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(lambda _: subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).parent, capture_output=True, timeout=15).returncode, range(6)))
+        self.assertEqual(results, [0] * 6)
+        self.assertEqual(self.state["refreshes"], 1)
+        self.assertEqual(self.conn.stored()["refresh_token"], "FAKE-ROTATED-1")
 
-    try:
-        # Logged out: the contract answer, signed_out, no usage.
-        code, conn = req("/api/connection")
-        assert code == 200 and list(conn) == CONTRACT_KEYS, conn
-        assert conn["contract"] == "wizard.ai-connection/1" and conn["provider"] == "chatgpt" and conn["name"] == "ChatGPT"
-        assert conn["status"] == "not_connected" and conn["usage"] is None and conn["plan"] is None
-        assert conn["error"]["code"] == "signed_out", conn
-        assert row()["status"] == "not_connected"
+    def test_invalid_grant_expires_erases_chain_and_no_retries(self):
+        self.seed(time.time() - 1); self.state["invalid"] = True
+        for _ in range(3):
+            with self.assertRaises(codex.Fault) as e:
+                self.conn.access()
+            self.assertEqual(e.exception.code, "expired")
+        self.assertEqual(self.state["refreshes"], 1)
+        self.assertEqual(self.conn.stored(), {"status": "expired"})
 
-        # Box-only: every proxy header is refused, the page stays open.
-        for h in ({"Tailscale-User-Login": "x@y"}, {"X-Forwarded-For": "1.2.3.4"}, {"Forwarded": "for=1.2.3.4"},
-                  {"X-Real-IP": "1.2.3.4"}, {"CF-Connecting-IP": "1.2.3.4"}, {"cf-ray": "abc"}):
-            code, d = req("/api/connection", None, h)
-            assert code == 403 and "box-only" in d["error"] and "status" not in d, (h, d)
-        r = urllib.request.Request(base + "/", headers={"Tailscale-User-Login": "x@y"})
-        assert urllib.request.urlopen(r, timeout=10).status == 200
+    def test_backend_401_refresh_once_does_not_destroy_valid_chain(self):
+        self.seed(); self.state["mode"] = "unauthorized"
+        with self.assertRaises(codex.Fault) as e: self.conn.models()
+        self.assertEqual(e.exception.status, 401)
+        self.assertEqual(self.state["refreshes"], 1)
+        self.assertEqual(self.conn.stored()["status"], "connected")
+        self.assertEqual(self.conn.stored()["refresh_token"], "FAKE-ROTATED-1")
+        self.state["mode"] = "ok"
+        self.assertEqual(self.conn.models()[0]["id"], "gpt-5.6-sol")
 
-        # The answer is cached for 60 s: a sign-in made elsewhere shows on the next uncached read.
-        n = len(Fake.calls)
-        req("/api/connection")
-        assert len(Fake.calls) == n, "second read inside 60 s must come from the cache"
+    def test_refresh_chain_failure_codes_expire_once(self):
+        for code in ("refresh_token_expired", "refresh_token_reused", "REFRESH_TOKEN_INVALIDATED"):
+            self.state["invalid"] = True; self.state["invalid_code"] = code
+            self.seed(time.time() - 1)
+            count = self.state["refreshes"]
+            for _ in range(2):
+                with self.assertRaises(codex.Fault) as e: self.conn.access()
+                self.assertEqual(e.exception.code, "expired")
+            self.assertEqual(self.state["refreshes"], count + 1)
+            self.assertEqual(self.conn.stored(), {"status": "expired"})
 
-        # Use before connecting is refused.
-        assert req("/api/chatgpt/use", {})[0] == 409 and not Fake.model_set
+    def test_rotated_tokens_survive_transient_disk_failure_without_second_refresh(self):
+        self.seed(time.time() - 1)
+        atomic = self.conn.atomic
+        def disk(name, obj):
+            if name == "connection.json" and obj.get("status") == "connected":
+                raise OSError("disk full, secret text must not escape")
+            atomic(name, obj)
+        with patch.object(self.conn, "atomic", side_effect=disk):
+            with self.assertRaises(codex.Fault) as e: self.conn.access()
+            self.assertNotIn("secret text", str(e.exception))
+        self.assertEqual(self.conn.stored()["status"], "refreshing")
+        other = codex.Connection(self.conn.data, self.upstream, self.upstream + "/backend-api")
+        with self.assertRaises(codex.Fault): other.access()
+        self.assertEqual(self.state["refreshes"], 1)
+        self.assertTrue(self.conn.access())
+        self.assertEqual(self.conn.stored()["refresh_token"], "FAKE-ROTATED-1")
+        self.assertEqual(self.state["refreshes"], 1)
 
-        # Connect -> code + OpenAI link; Hermes' session id never leaves the server.
-        code, d = req("/api/chatgpt/connect", {})
-        assert code == 200 and d["code"] == "ABCD-1234" and d["url"] == "https://auth.openai.com/codex/device", d
-        assert "session_id" not in d and "s0" not in json.dumps(d), d
-        assert row()["signing_in"] is True
-        assert req("/api/chatgpt/poll", {"login_id": "stale"})[0] == 409
-        assert req("/api/chatgpt/poll", {"login_id": d["login_id"]})[1]["status"] == "pending"
+    def test_ambiguous_refresh_does_not_replay_after_restart(self):
+        self.seed(time.time() - 1)
+        with patch.object(self.conn, "json_request", side_effect=codex.Fault("unreachable", "Unavailable", 503)) as req:
+            with self.assertRaises(codex.Fault): self.conn.access()
+            self.assertEqual(req.call_count, 1)
+        other = codex.Connection(self.conn.data, self.upstream, self.upstream + "/backend-api")
+        with self.assertRaises(codex.Fault): other.access()
+        self.assertEqual(self.state["refreshes"], 0)
+        self.assertEqual(server.account_row()["status"], "expired")
 
-        # The dashboard session expires mid-way: the app signs in again and carries on.
-        Fake.expire_cookie_once = True
-        assert req("/api/chatgpt/poll", {"login_id": d["login_id"]})[1]["status"] == "pending"
+    def test_pending_login_network_does_not_block_existing_access(self):
+        self.seed()
+        request = self.conn.json_request
+        entered, release = threading.Event(), threading.Event()
+        def waiting(url, *args, **kw):
+            if url.endswith("/usercode"):
+                entered.set(); release.wait(3)
+            return request(url, *args, **kw)
+        with patch.object(self.conn, "json_request", side_effect=waiting):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                login = pool.submit(self.conn.connect)
+                self.assertTrue(entered.wait(1))
+                try:
+                    self.assertTrue(pool.submit(self.conn.access).result(timeout=.4))
+                finally:
+                    release.set()
+                self.assertTrue(login.result()["ok"])
 
-        # Approved while the agent's other account works: connected, NOT switched; the cache is cleared.
-        # Without the Wizard OS plugin route on the agent's dashboard, usage stays null (checked below).
-        Fake.sessions["s0"], Fake.logged_in = "approved", True
-        code, d3 = req("/api/chatgpt/poll", {"login_id": d["login_id"]})
-        assert code == 200 and d3["status"] == "approved" and "keeps its current account" in d3["message"], d3
-        assert not Fake.model_set and Fake.current != "openai-codex"
-        code, conn = req("/api/connection")
-        assert conn["status"] == "connected" and conn["usage"] is None and conn["error"] is None, conn
-        assert conn["account"] == "owner@example.com" and conn["plan"] is None, conn
+    def test_cancel_wrong_login_and_access_only_no_refresh(self):
+        d = self.conn.connect()
+        with self.assertRaises(codex.Fault): self.conn.poll("wrong")
+        self.conn.cancel()
+        with self.assertRaises(codex.Fault): self.conn.poll(d["login_id"])
+        self.seed()
+        s = self.conn.stored(); s.pop("refresh_token")
+        self.conn.atomic("connection.json", s)
+        self.assertEqual(self.conn.access(), s["access_token"])
+        s["expires_at"] = 1; self.conn.atomic("connection.json", s)
+        with self.assertRaises(codex.Fault): self.conn.access()
+        self.assertEqual(self.state["refreshes"], 0)
 
-        c = row()
-        assert c["status"] == "connected" and c["in_use"] is False and not c["signing_in"], c
+    def test_stopped_copy_migration_preserves_key_rotates_on_new_box(self):
+        self.login()
+        self.seed(time.time() - 1)
+        target = Path(self.tmp.name) / "new-box" / "app-data"
+        shutil.copytree(self.conn.data, target)
+        # Old instance stopped: no further call against source store.
+        new = codex.Connection(target, self.upstream, self.upstream + "/backend-api")
+        self.assertEqual(new.gateway_token(), self.conn.gateway_token())
+        self.assertTrue(new.access())
+        self.assertEqual(new.stored()["refresh_token"], "FAKE-ROTATED-1")
+        self.assertEqual(self.state["refreshes"], 1)
 
-        # Use ChatGPT switches the main model to the first featured ChatGPT model (owner's button only).
-        code, d4 = req("/api/chatgpt/use", {})
-        assert code == 200 and d4["ok"], d4
-        assert Fake.model_set[-1] == {"scope": "main", "provider": "openai-codex", "model": "gpt-6-sol",
-                                      "confirm_expensive_model": True}, Fake.model_set
-        assert row()["in_use"] is True
-
-        # Disconnect: signed out, the owner is told the agent was using it, the contract follows at once.
-        code, d5 = req("/api/chatgpt/logout", {})
-        assert code == 200 and "was using ChatGPT" in d5["message"], d5
-        assert req("/api/connection")[1]["status"] == "not_connected"
-
-        # A fresh agent with no working account: approving switches it automatically.
-        Fake.current, Fake.current_ok, Fake.model_set = "claude-subscription-directsdk-experimental", False, []
-        d = req("/api/chatgpt/connect", {})[1]
-        Fake.sessions[max(Fake.sessions)], Fake.logged_in = "approved", True
-        d6 = req("/api/chatgpt/poll", {"login_id": d["login_id"]})[1]
-        assert "now uses ChatGPT" in d6["message"] and Fake.current == "openai-codex", d6
-
-        # With the Wizard OS plugin route, plan and usage come from the agent's own read; still no token here.
-        Fake.usage_route = True
-        code, conn = req("/api/connection")
-        assert conn["status"] == "connected" and conn["plan"] == "Pro" and conn["error"] is None, conn
-        assert conn["usage"]["limits"][0] == {"id": "weekly:0", "label": "Weekly", "usedPercent": 6.0,
-                                              "remainingPercent": 94, "resetsAt": "2026-10-22T06:13:23.000Z"}, conn
-        assert "GET /api/plugins/wizard-os/ai-usage/chatgpt" in Fake.calls
-        Fake.usage_route = False
-
-        # Cancel ends Hermes' own session too.
-        Fake.logged_in = False
-        d = req("/api/chatgpt/connect", {})[1]
-        sid = max(Fake.sessions)
-        assert req("/api/chatgpt/cancel", {})[1]["ok"] and sid not in Fake.sessions
-        assert req("/api/chatgpt/poll", {"login_id": d["login_id"]})[0] == 409
-
-        # Expired code: a clear message, nothing switched.
-        Fake.current, Fake.model_set = "claude-subscription-directsdk-experimental", []
-        d = req("/api/chatgpt/connect", {})[1]
-        Fake.sessions[max(Fake.sessions)] = "expired"
-        code, d7 = req("/api/chatgpt/poll", {"login_id": d["login_id"]})
-        assert code == 400 and "expired" in d7["message"] and not Fake.model_set, d7
-
-        # Cross-site and non-JSON posts are refused.
-        for hdr in ({"Content-Type": "application/json", "Origin": "http://evil.example"}, {"Content-Type": "text/plain"}):
-            r = urllib.request.Request(base + "/api/chatgpt/use", data=b"{}", headers=hdr)
-            try:
-                urllib.request.urlopen(r, timeout=10)
-                raise AssertionError("post accepted")
-            except urllib.error.HTTPError as e:
-                assert e.code in (403, 415), e.code
-
-        # No credential surface.
-        for path in ("/auth.json", "/server.py", "/static/../server.py", "/api/chatgpt/token"):
-            assert req(path)[0] == 404, path
-        code, cardj = req("/.well-known/mcp/server-cards.json")
-        assert cardj["x-wizard"]["provides"] == ["ai-connection", "chatgpt-subscription"], cardj
-        assert cardj["x-wizard"]["agent_dashboard"] == "configured"
-
-        everything = "\n".join(seen)
-        for secret in (TOKEN, TOKEN[-4:], "dash-pass", "hermes_session_at", '"s0"', '"s1"'):
-            assert secret not in everything, secret
-        assert "/auth/password-login" in " ".join(Fake.calls)
-        print(json.dumps({"ok": True, "hermes_calls": len(Fake.calls), "browser_responses": len(seen)}))
-    finally:
-        proc.terminate()
-        proc.wait(10)
-        stub.shutdown()
+    def test_csrf_page_auth_gateway_ignores_page_password(self):
+        self.assertEqual(self.call("/api/chatgpt/connect", {})[0], 403)
+        self.assertEqual(self.call("/api/chatgpt/connect", {}, {"Origin": "https://evil.example", "X-Wizard-Request": "1"})[0], 403)
+        with patch.object(server, "PASSWORD", "owner-pass"):
+            self.assertEqual(self.call("/api/accounts")[0], 401)
+            self.assertEqual(self.call("/v1/models", headers={"Authorization": "Basic " + base64.b64encode(b"owner:owner-pass").decode()})[0], 401)
 
 
-def unreachable():
-    """No dashboard login (alongside box) or a dead dashboard: status error / unreachable, a plain message."""
-    for extra in ({}, {"WIZARD_CHATGPT_HERMES_URL": "http://127.0.0.1:9", "WIZARD_CHATGPT_HERMES_PASSWORD": "x" * 20}):
-        proc, base = start(extra)
-        try:
-            conn = json.loads(urllib.request.urlopen(base + "/api/connection", timeout=15).read())
-            assert list(conn) == CONTRACT_KEYS and conn["status"] == "error" and conn["usage"] is None, conn
-            assert conn["error"]["code"] == "unreachable" and "Hermes Agent" in conn["error"]["message"], conn
-            rows = json.loads(urllib.request.urlopen(base + "/api/accounts", timeout=15).read())["accounts"]
-            assert rows[0]["status"] == "error" and "Hermes Agent" in rows[0]["problem"], rows
-            r = urllib.request.Request(base + "/api/chatgpt/connect", data=b"{}", headers={"Content-Type": "application/json"})
-            try:
-                urllib.request.urlopen(r, timeout=15)
-                raise AssertionError("connect without a dashboard succeeded")
-            except urllib.error.HTTPError as e:
-                assert e.code == 502, e.code
-        finally:
-            proc.terminate()
-            proc.wait(10)
-    print(json.dumps({"ok": True, "unreachable": "error/unreachable"}))
+class GatewayTests(AppCase):
+    def test_gateway_header_auth_path_refusals_and_secret_error_sanitization(self):
+        self.seed()
+        self.assertEqual(self.call("/v1/models")[0], 401)
+        self.assertEqual(self.call("/v1/models", headers={"Authorization": "Bearer wrong"})[0], 401)
+        for k in ("Origin", "Referer", "Cookie", "Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "CF-Ray", "Sec-Fetch-Site", "Via", "Tailscale-User-Login"):
+            self.assertEqual(self.call("/v1/models", headers={**self.auth(), k: "browser"})[0], 403, k)
+        # Node's fetch (the Agent Service usage reader) always sends Sec-Fetch-Mode: cors and nothing else.
+        self.assertEqual(self.call("/v1/models", headers={**self.auth(), "Sec-Fetch-Mode": "cors"})[0], 200)
+        self.assertEqual(self.call("/v1/models", headers={**self.auth(), "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "cross-site"})[0], 403)
+        self.assertEqual(self.call("/v1/evil", {}, self.auth())[0], 404)
+        self.state["mode"] = "error"
+        status, raw, hdr = self.call("/v1/responses", {"model": "gpt-5.6-sol", "input": []}, self.auth())
+        self.assertEqual(status, 400)
+        self.assertNotIn(self.state["refresh"], raw.decode())
+        self.assertNotIn("eyJ", raw.decode())
+        self.assertFalse(any(k.lower() == "set-cookie" for k in hdr))
+
+    def test_models_usage_compaction_and_real_token_injection(self):
+        self.seed()
+        status, raw, _ = self.call("/v1/models", headers=self.auth())
+        self.assertEqual((status, json.loads(raw)["data"][0]["id"]), (200, "gpt-5.6-sol"))
+        self.assertEqual(json.loads(raw)["models"][0]["slug"], "gpt-5.6-sol")  # Codex shape for stock Hermes
+        self.assertEqual(self.call("/v1/api/codex/usage", headers=self.auth())[0], 200)
+        self.assertEqual(self.call("/v1/api/codex/rate-limit-reset-credits", headers=self.auth())[0], 200)
+        status, raw, _ = self.call("/v1/responses/compact", {"model": "gpt-5.6-sol", "input": []}, self.auth())
+        self.assertEqual((status, json.loads(raw)["object"]), (200, "response.compaction"))
+        h = {k.lower(): v for k, v in self.state["requests"][-1][2].items()}
+        self.assertEqual(h["authorization"], "Bearer " + self.conn.stored()["access_token"])
+        self.assertEqual(h["chatgpt-account-id"], "FAKE-ACCOUNT-PRIVATE")
+        self.assertEqual(h["originator"], "hermes-agent")
+        self.assertNotIn(self.conn.gateway_token(), str(h))
+
+    def test_streaming_flush_normalization_and_safe_headers(self):
+        self.seed(); self.state["mode"] = "slow"
+        body = {"model": "gpt-5.6-sol", "input": [], "max_tokens": 100, "temperature": .2}
+        req = Request(self.base + "/v1/responses", data=json.dumps(body).encode(), headers={**self.auth(), "Content-Type": "application/json"})
+        with urlopen(req, timeout=3) as r:
+            raw = b""
+            while b"response.output_text.delta" not in raw:
+                raw += r.readline()
+            self.assertFalse(self.state["continue"].is_set())
+            self.assertEqual(r.headers["x-codex-primary-used-percent"], "25")
+            self.assertIsNone(r.headers.get("Set-Cookie"))
+            self.state["continue"].set()
+            raw += r.read()
+            self.assertIn(b"response.completed", raw)
+        data = self.state["requests"][-1][3]
+        self.assertTrue(data["stream"]); self.assertFalse(data["store"])
+        self.assertNotIn("max_tokens", data); self.assertNotIn("temperature", data)
+
+
+class RegistrationTests(AppCase):
+    def dashboard(self):
+        self.rows = []
+        self.endpoints = []
+        self.native_adds = 0
+        self.deletes = []
+        self.dashboard_writes = []
+        def call(method, path, body=None, **kw):
+            if method == "GET" and path == "/api/providers/oauth":
+                return {"providers": [{"id": "openai-codex", "status": {"logged_in": False, "token_preview": None}}]}
+            if method == "GET" and path == "/api/credentials/pool":
+                return {"providers": [{"provider": "openai-codex", "entries": list(self.rows)}]}
+            if method == "GET" and path == "/api/providers/custom-endpoints":
+                return {"endpoints": self.endpoints}
+            self.dashboard_writes.append((method, path, body))
+            if method == "POST" and path == "/api/providers/custom-endpoints":
+                self.assertFalse(body["make_default"])
+                self.assertEqual(body["api_key"], self.conn.gateway_token())
+                self.endpoints = [{"id": body["id"], "base_url": body["base_url"]}]
+            if method == "POST" and path == "/api/credentials/pool":
+                self.native_adds += 1
+                self.assertEqual(body["api_key"], self.conn.gateway_token())
+                self.rows.append({"index": 7, "label": body["label"], "has_refresh": False})
+            if method == "DELETE" and path.startswith("/api/credentials/pool/"):
+                index = int(path.rsplit("/", 1)[1]); self.deletes.append(index)
+                self.rows[:] = [r for r in self.rows if r["index"] != index]
+            if method == "DELETE" and path.startswith("/api/providers/custom-endpoints/"):
+                self.endpoints = []
+            return {"ok": True}
+        return call
+
+    def test_reconcile_concurrent_single_registration_and_idempotent_key(self):
+        self.seed()
+        with patch.object(server, "HERMES_PASSWORD", "fake-dash"), patch.object(server.Hermes, "call", side_effect=self.dashboard()):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(lambda _: server.reconcile(), range(16)))
+            self.assertEqual(results, ["registered"] * 16)
+            self.assertEqual(len(self.rows), 1)
+            self.assertEqual(self.native_adds, 1)
+            self.assertEqual(self.deletes, [])
+
+    def test_legacy_singleton_conflict_before_any_dashboard_write(self):
+        self.seed()
+        call = self.dashboard()
+        def legacy(method, path, body=None, **kw):
+            if path == "/api/providers/oauth":
+                return {"providers": [{"id": "openai-codex", "status": {"logged_in": True, "token_preview": "last-five"}}]}
+            return call(method, path, body, **kw)
+        with patch.object(server, "HERMES_PASSWORD", "fake-dash"), patch.object(server.Hermes, "call", side_effect=legacy):
+            self.assertTrue(server.register([{"id": "gpt-5.6-sol"}]).startswith("conflict"))
+            self.assertEqual(self.dashboard_writes, [])
+
+    def test_conflict_and_unregister_target_index_preserve_other_login(self):
+        self.seed()
+        call = self.dashboard()
+        self.rows = [{"index": 7, "label": server.ENDPOINT_ID}, {"index": 2, "label": "owner-other-account"}]
+        with patch.object(server, "HERMES_PASSWORD", "fake-dash"), patch.object(server.Hermes, "call", side_effect=call):
+            self.assertTrue(server.register([{"id": "gpt-5.6-sol"}]).startswith("conflict"))
+            self.assertEqual(self.dashboard_writes, [])
+            server.unregister()
+            self.assertEqual(self.deletes, [7])
+            self.assertEqual(self.rows, [{"index": 2, "label": "owner-other-account"}])
+
+    def test_failed_key_replacement_does_not_cache_success_fingerprint(self):
+        self.seed()
+        call = self.dashboard()
+        self.rows = [{"index": 7, "label": server.ENDPOINT_ID, "has_refresh": False}]
+        self.conn.atomic("registration.json", {"status": "registered", "key_sha256": "old-key", "base_url": server.AGENT_BASE})
+        fail = [True]
+        def transient(method, path, body=None, **kw):
+            if method == "DELETE" and path.startswith("/api/credentials/pool/") and fail[0]:
+                fail[0] = False
+                raise server.HermesError("transient")
+            return call(method, path, body, **kw)
+        with patch.object(server, "HERMES_PASSWORD", "fake-dash"), patch.object(server.Hermes, "call", side_effect=transient):
+            self.assertEqual(server.reconcile(), "unavailable")
+            self.assertNotIn("key_sha256", json.loads((self.conn.data / "registration.json").read_text()))
+            self.assertEqual(server.reconcile(), "registered")
+            self.assertEqual(self.native_adds, 1)
+
+    def test_absent_endpoint_cleanup_is_idempotent(self):
+        self.seed()
+        with patch.object(server, "HERMES_PASSWORD", "fake-dash"), patch.object(server.Hermes, "call", side_effect=self.dashboard()):
+            server.unregister(); server.unregister()
+        self.assertEqual(server.registration(), "not_registered")
+        self.assertFalse(any(method == "DELETE" and path.startswith("/api/providers/custom-endpoints/") for method, path, _ in self.dashboard_writes))
+
+    def test_failed_cleanup_and_registration_status_disk_error_are_honest(self):
+        self.seed()
+        with patch.object(server, "HERMES_PASSWORD", "fake-dash"), patch.object(server.Hermes, "call", side_effect=server.HermesError("unavailable")):
+            server.unregister()
+            self.assertEqual(server.registration(), "unregister_failed")
+        atomic = self.conn.atomic
+        def failing(name, obj):
+            if name == "registration.json": raise OSError("disk full")
+            return atomic(name, obj)
+        with patch.object(server, "register", return_value="registered"), patch.object(self.conn, "atomic", side_effect=failing):
+            self.assertEqual(server.reconcile(), "registered")
+        self.assertEqual(self.conn.stored()["status"], "connected")
 
 
 if __name__ == "__main__":
-    main()
-    unreachable()
+    unittest.main(verbosity=2)

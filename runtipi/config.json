@@ -9,9 +9,9 @@
   "categories": [
     "network"
   ],
-  "description": "Connect your ChatGPT Plus or Pro subscriptions to your Wizard server. Each sign-in is your agent's own ChatGPT login (a short code you paste on ChatGPT; turn on Device code sign-in for Codex in ChatGPT Settings, Security first), so your agent keeps and renews it and this app never sees a token. The app shows each subscription with how much of its usage is left and reports them to Wizard's home screen. Works with the Hermes Agent app or your own Hermes on this server.",
-  "tipi_version": 1,
-  "version": "0.2.4",
+  "description": "Connect any number of Chatgpt subscriptions in this app. The app owns sign-in and renewal in private app-data. Your agent consumes an owner-granted connection; provider credentials do not belong to the agent.",
+  "tipi_version": 2,
+  "version": "0.3.1",
   "source": "https://github.com/oscarhenrycollins/chatgpt-connection",
   "exposable": false,
   "supported_architectures": [
@@ -36,17 +36,17 @@
       "type": "text",
       "label": "Hermes Agent dashboard username",
       "env_variable": "HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
-      "required": true,
+      "required": false,
       "default": "hermes",
-      "hint": "Filled in automatically from your agent. Used only to list, add, reconnect or remove ChatGPT subscriptions inside the agent."
+      "hint": "Used for agent connection registration/status only, never to sign in to your subscription."
     },
     {
       "type": "password",
       "label": "Hermes Agent dashboard password",
       "env_variable": "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
-      "required": true,
+      "required": false,
       "min": 16,
-      "hint": "Filled in automatically from your Hermes Agent app (the same dashboard password). ChatGPT signs in inside Hermes, so this app never sees that token."
+      "hint": "Used for agent connection registration/status only, never to sign in to your subscription."
     },
     {
       "type": "text",

@@ -1,474 +1,476 @@
-"""ChatGPT: the owner connects his ChatGPT subscription once; the agent on the same server uses it.
-
-A Wizard AI connection app (contract wizard.ai-connection/1, decision #61). The sign-in is stock Hermes
-Agent's own ChatGPT (Codex) device-code login, driven through that agent's dashboard API with the
-dashboard login this app was installed with. Hermes creates, stores and refreshes the ChatGPT tokens
-itself; Codex refresh tokens are single-use, so this app never sees, copies or holds one.
-
-Usage numbers: read from the Wizard OS Hermes plugin's read-only dashboard route
-(/api/plugins/wizard-os/ai-usage/chatgpt), so Hermes reads its own sign-in and this app never holds a token.
-Without that plugin route `usage` stays null and the Agent Service keeps its own reader.
-"""
+"""ChatGPT app owns OAuth; Hermes receives only a revocable box-local bearer."""
 from __future__ import annotations
 
 import base64
 import hmac
 import http.cookiejar
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+from pathlib import Path
 import re
-import secrets
 import signal
 import socketserver
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlsplit
+from urllib.request import Request, build_opener, ProxyHandler, HTTPCookieProcessor
 
-VERSION = "0.1.4"
-CONTRACT = "wizard.ai-connection/1"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import inference
+import codex
+
+VERSION = "0.3.1"
+CONTRACT = "wizard.ai-connection/2"
 APP = Path(__file__).resolve().parent
 BIND = os.environ.get("WIZARD_CHATGPT_BIND", "0.0.0.0")
 PORT = int(os.environ.get("WIZARD_CHATGPT_PORT", "8801"))
 PASSWORD = os.environ.get("WIZARD_CHATGPT_PASSWORD", "")
-# The agent's dashboard: by default the Hermes Agent app on the Runtipi main network.
-HERMES_URL = (os.environ.get("WIZARD_CHATGPT_HERMES_URL", "") or "http://hermes-agent:9119").rstrip("/")
-HERMES_USER = os.environ.get("WIZARD_CHATGPT_HERMES_USER", "") or "hermes"
+HERMES_URL = (os.environ.get("WIZARD_CHATGPT_HERMES_URL") or "http://hermes-agent:9119").rstrip("/")
+HERMES_USER = os.environ.get("WIZARD_CHATGPT_HERMES_USER") or "hermes"
 HERMES_PASSWORD = os.environ.get("WIZARD_CHATGPT_HERMES_PASSWORD", "")
-CODEX = "openai-codex"   # Hermes' provider id for a ChatGPT subscription
-CHATGPT_HOSTS = {"auth.openai.com"}
-CACHE_S = 60
-URL = re.compile(r"https://[^\s\"'<>]+")
-STATIC = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-          "/app.css": ("app.css", "text/css; charset=utf-8"), "/SKILL.md": ("SKILL.md", "text/markdown; charset=utf-8")}
-# Owner-data routes are box-only: the same port is published on the tailnet (Serve, tunnels and
-# proxies add these headers), while agents and the Agent Service call the app on the app network.
-PROXY_HEADERS = ("tailscale-user-login", "x-forwarded-for", "forwarded", "x-real-ip")
-NO_AGENT = ("ChatGPT signs in inside the Hermes Agent app, and this app can't reach its dashboard. "
-            "Install Hermes Agent from Wizard Apps, then reinstall ChatGPT. If your own Hermes runs on this "
-            "server outside Wizard Apps, sign in there with `hermes auth add openai-codex`; Wizard still "
-            "shows your ChatGPT usage from that sign-in.")
+AGENT_BASE = os.environ.get("WIZARD_CHATGPT_AGENT_URL") or f"http://wizard-chatgpt:{PORT}/v1"
+ENDPOINT_ID = "wizard-chatgpt"
+STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
+          "/appearance.js": ("appearance.js", "text/javascript"), "/appearance.css": ("appearance.css", "text/css"),
+          "/app.js": ("app.js", "text/javascript"), "/app.css": ("app.css", "text/css"), "/SKILL.md": ("SKILL.md", "text/markdown")}
+ORIGIN_PATTERN = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
+FRAME_ANCESTORS = " ".join(["'self'"] + [o for o in (x.strip().rstrip("/") for x in os.environ.get("WIZARD_TRUSTED_ORIGINS", "").split(",")) if ORIGIN_PATTERN.match(o)])
+OWNER = None
+GATEWAY_SLOTS = threading.BoundedSemaphore(8)
+INIT_LOCK = threading.Lock()
+REGISTRATION_LOCK = threading.RLock()
 
 
-_ORIGIN = re.compile(r"^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
-FRAME_ANCESTORS = " ".join(["'self'"] + [o for o in (x.strip().rstrip("/") for x in
-                                         os.environ.get("WIZARD_TRUSTED_ORIGINS", "").split(","))
-                                         if _ORIGIN.match(o)])
+def owner():
+    global OWNER
+    with INIT_LOCK:
+        if OWNER is None:
+            from account_owner import Pool
+            OWNER = Pool(os.environ.get("APP_DATA_DIR", str(APP / ".data")))
+    return OWNER
 
 
 class HermesError(Exception):
-    def __init__(self, message: str, code: str = "provider_error"):
-        super().__init__(message)
-        self.code = code
+    code = "unreachable"
 
 
 class Hermes:
-    """The agent's dashboard, signed in with its dashboard login (session cookies, kept in memory).
-    Only the ChatGPT sign-in and model routes are called. Error text never carries a token."""
+    """Dashboard registration only. Never drives OAuth or model requests."""
     lock = threading.Lock()
     opener = None
 
     @classmethod
-    def configured(cls) -> bool:
+    def configured(cls):
         return bool(HERMES_PASSWORD)
 
     @classmethod
     def _login(cls):
         jar = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-        body = json.dumps({"provider": "basic", "username": HERMES_USER, "password": HERMES_PASSWORD}).encode()
-        req = urllib.request.Request(HERMES_URL + "/auth/password-login", data=body, method="POST",
-                                     headers={"Content-Type": "application/json"})
-        try:
-            with opener.open(req, timeout=20) as res:
-                res.read()
-        except urllib.error.HTTPError as e:
-            raise HermesError("Hermes Agent did not accept this app's dashboard login. Reinstall ChatGPT so it "
-                              "gets the Hermes Agent dashboard login." if e.code in (401, 403, 404)
-                              else f"Hermes Agent answered {e.code}.", "provider_error") from None
-        except OSError:
-            raise HermesError(NO_AGENT, "unreachable") from None
-        cls.opener = opener
+        op = build_opener(ProxyHandler({}), codex.NoRedirect(), HTTPCookieProcessor(jar))
+        req = Request(HERMES_URL + "/auth/password-login", data=json.dumps({"provider": "basic", "username": HERMES_USER, "password": HERMES_PASSWORD}).encode(), headers={"Content-Type": "application/json"})
+        with op.open(req, timeout=20) as r:
+            r.read()
+        cls.opener = op
 
     @classmethod
-    def call(cls, method: str, path: str, body: dict | None = None, timeout: int = 40) -> dict:
+    def call(cls, method, path, body=None, timeout=40):
         if not cls.configured():
-            raise HermesError(NO_AGENT, "unreachable")
+            raise HermesError("Hermes dashboard is not configured.")
         for attempt in (0, 1):
-            with cls.lock:
-                if cls.opener is None:
-                    cls._login()
-                opener = cls.opener
-            data = None if body is None else json.dumps(body).encode()
-            req = urllib.request.Request(HERMES_URL + path, data=data, method=method,
-                                         headers={"Content-Type": "application/json"} if data is not None else {})
             try:
-                with opener.open(req, timeout=timeout) as res:
-                    return json.loads(res.read() or b"{}")
-            except urllib.error.HTTPError as e:
-                if e.code == 401 and attempt == 0:   # the dashboard session expired: sign in once more
+                with cls.lock:
+                    if cls.opener is None:
+                        cls._login()
+                    op = cls.opener
+                    assert op is not None
+                req = Request(HERMES_URL + path, data=None if body is None else json.dumps(body).encode(), method=method, headers={"Content-Type": "application/json"})
+                with op.open(req, timeout=timeout) as r:
+                    return json.loads(r.read(4 * 1024 * 1024) or b"{}")
+            except HTTPError as e:
+                status = e.code
+                e.close()
+                if status == 401 and not attempt:
                     with cls.lock:
                         cls.opener = None
                     continue
-                try:
-                    detail = str(json.loads(e.read() or b"{}").get("detail") or "")
-                except (ValueError, AttributeError):
-                    detail = ""
-                raise HermesError(URL.sub("[link]", detail)[:200] or f"Hermes Agent answered {e.code}.") from None
+                raise HermesError("Hermes dashboard registration was rejected.") from None
             except (OSError, ValueError):
-                raise HermesError(NO_AGENT, "unreachable") from None
-        raise HermesError("Hermes Agent did not accept this app's dashboard login.")
+                raise HermesError("Hermes dashboard is unavailable.") from None
+        raise HermesError("Hermes dashboard login was rejected.")
 
 
-def _label(status: dict) -> str | None:
-    """An email-shaped account label, if Hermes' status names one (pool rows are labelled `pool:<label>`)."""
-    source = str(status.get("source") or "")
-    for value in (status.get("email"), status.get("account_email"), source[5:] if source.startswith("pool:") else None):
-        if isinstance(value, str) and "@" in value and len(value) <= 120:
-            return value
-    return None
+def pool_rows(payload):
+    return next((r.get("entries", []) for r in payload.get("providers", []) if r.get("provider") == "openai-codex"), [])
 
 
-def chatgpt_status() -> dict:
-    """Connected or not (from Hermes' own sign-in status) and whether the agent uses it now. No token data."""
+def register(models):
+    with REGISTRATION_LOCK:
+        if owner().stored().get("status") != "connected":
+            return "not_registered"
+        return _register(models)
+
+
+def _register(models):
+    """Register native Codex routing without changing any model selection.
+
+    Stock dashboard custom-endpoints are *always* custom runtimes, so also provision the
+    native provider's API-key pool entry + box URL override. No OAuth/refresh token in Hermes.
+    Refuse coexistence with other Codex credentials rather than redirect them to our box.
+    """
+    if not models or not Hermes.configured():
+        return "unavailable"
+    key = owner().gateway_token()
     try:
-        rows = Hermes.call("GET", "/api/providers/oauth").get("providers") or []
-        row = next((p for p in rows if isinstance(p, dict) and p.get("id") == CODEX), None)
-        info = Hermes.call("GET", "/api/model/info")
-    except HermesError as e:
-        return {"status": "error", "code": e.code, "detail": str(e)}
-    if row is None:
-        return {"status": "error", "code": "provider_error", "detail": "This Hermes Agent has no ChatGPT sign-in."}
-    in_use = info.get("provider") == CODEX
-    status = row.get("status") or {}
-    if not status.get("logged_in"):
-        return {"status": "not_connected", "in_use": in_use}
-    return {"status": "connected", "account": _label(status), "in_use": in_use,
-            "model": str(info.get("model") or "")[:80] if in_use else ""}
-
-
-USAGE_PATH = "/api/plugins/wizard-os/ai-usage/chatgpt"
-
-
-def chatgpt_usage() -> tuple[str | None, dict | None]:
-    """(plan, usage) from the Wizard OS plugin's read-only route on the agent's dashboard: Hermes reads its own
-    ChatGPT usage, so this app still never holds a token. (None, None) when the route is missing (an agent
-    without the plugin) or the read fails; the Agent Service then keeps its own reader."""
-    try:
-        d = Hermes.call("GET", USAGE_PATH, timeout=30)
+        rows = pool_rows(Hermes.call("GET", "/api/credentials/pool"))
+        if any(r.get("label") != ENDPOINT_ID for r in rows):
+            return "conflict: remove existing Hermes Codex credentials before app-owned routing"
+        if not rows:
+            oauth = Hermes.call("GET", "/api/providers/oauth").get("providers", [])
+            status = next((p.get("status", {}) for p in oauth if p.get("id") == "openai-codex"), None)
+            if status is None or status.get("error"):
+                return "unavailable"
+            if status.get("logged_in") or status.get("token_preview"):
+                return "conflict: remove existing Hermes Codex credentials before app-owned routing"
+        # A named custom endpoint is discoverable and provides an explicit fallback.
+        ids = [m["id"] for m in models]
+        Hermes.call("POST", "/api/providers/custom-endpoints", {"id": ENDPOINT_ID, "name": "ChatGPT app", "base_url": AGENT_BASE,
+                    "model": ids[0], "models": ids, "api_key": key, "api_mode": "codex_responses", "discover_models": False, "make_default": False})
+        listed = Hermes.call("GET", "/api/providers/custom-endpoints").get("endpoints", [])
+        if not any(r.get("id") == ENDPOINT_ID and r.get("base_url", "").rstrip("/") == AGENT_BASE.rstrip("/") for r in listed):
+            return "unavailable"
+        Hermes.call("PUT", "/api/env", {"key": "HERMES_CODEX_BASE_URL", "value": AGENT_BASE})
+        import hashlib
+        fingerprint = hashlib.sha256(key.encode()).hexdigest()
+        try:
+            previous = json.loads((owner().data / "registration.json").read_text())
+        except (OSError, ValueError):
+            previous = {}
+        if len(rows) != 1 or previous.get("key_sha256") != fingerprint or previous.get("base_url") != AGENT_BASE:
+            for row in reversed(rows):
+                Hermes.call("DELETE", f"/api/credentials/pool/openai-codex/{row['index']}")
+            Hermes.call("POST", "/api/credentials/pool", {"provider": "openai-codex", "api_key": key, "label": ENDPOINT_ID})
+        check = pool_rows(Hermes.call("GET", "/api/credentials/pool"))
+        return "registered" if any(r.get("label") == ENDPOINT_ID and not r.get("has_refresh") for r in check) else "unavailable"
     except HermesError:
-        return None, None
-    usage = d.get("usage") if d.get("ok") is True else None
-    if not isinstance(usage, dict) or not isinstance(usage.get("limits"), list):
-        return None, None
-    plan = d.get("plan")
-    return (str(plan)[:40] if isinstance(plan, str) and plan else None), {
-        "fetchedAt": usage.get("fetchedAt"), "limits": usage["limits"][:20], "paid": usage.get("paid")}
+        return "unavailable"
 
 
-class Cache:
-    lock = threading.Lock()
-    at = 0.0
-    value: dict | None = None
+def registration():
+    try:
+        return json.loads((owner().data / "registration.json").read_text()).get("status", "not_registered")
+    except (OSError, ValueError):
+        return "not_registered"
 
 
-def connection(fresh: bool = False) -> dict:
-    """The wizard.ai-connection/1 answer, cached 60 s (connect/disconnect clear it)."""
-    with Cache.lock:
-        if not fresh and Cache.value is not None and time.monotonic() - Cache.at < CACHE_S:
-            return Cache.value
-    s = chatgpt_status()
-    out = {"contract": CONTRACT, "provider": "chatgpt", "name": "ChatGPT", "status": s["status"],
-           "plan": None, "account": s.get("account") if s["status"] == "connected" else None,
-           "usage": None, "error": None}
-    if s["status"] == "connected":
-        plan, usage = chatgpt_usage()
-        out["plan"], out["usage"] = plan, usage
-    if s["status"] == "not_connected":
-        out["error"] = {"code": "signed_out", "message": "ChatGPT is not connected. Open the ChatGPT app and press Connect."}
-    elif s["status"] == "error":
-        out["error"] = {"code": s.get("code") or "provider_error", "message": s.get("detail") or "Something is wrong."}
-    with Cache.lock:
-        Cache.value, Cache.at = out, time.monotonic()
+def reconcile():
+    import hashlib
+    with REGISTRATION_LOCK:
+        try:
+            result = register(owner().models())
+            try:
+                with owner().lock():
+                    owner().atomic("registration.json", {"status": result, **({"base_url": AGENT_BASE, "key_sha256": hashlib.sha256(owner().gateway_token().encode()).hexdigest()} if result == "registered" else {})})
+            except OSError:
+                pass  # Login is independent of advisory dashboard-registration status.
+            return result
+        except codex.Fault:
+            return "unavailable"
+
+
+def unregister():
+    with REGISTRATION_LOCK:
+        return _unregister()
+
+
+def _unregister():
+    failed = False
+    # Only remove the app-labelled pool row. Never log out a different Codex login.
+    try:
+        rows = pool_rows(Hermes.call("GET", "/api/credentials/pool"))
+        for i in reversed(range(len(rows))):
+            if rows[i].get("label") == ENDPOINT_ID:
+                Hermes.call("DELETE", f"/api/credentials/pool/openai-codex/{rows[i]['index']}")
+        endpoints = Hermes.call("GET", "/api/providers/custom-endpoints").get("endpoints", [])
+        if any(r.get("id") == ENDPOINT_ID for r in endpoints):
+            Hermes.call("DELETE", "/api/providers/custom-endpoints/" + ENDPOINT_ID)
+        # Keep URL override fail-closed: removing it could send a residual local bearer to chatgpt.com.
+        if any(r.get("label") == ENDPOINT_ID for r in pool_rows(Hermes.call("GET", "/api/credentials/pool"))):
+            failed = True
+        if any(r.get("id") == ENDPOINT_ID for r in Hermes.call("GET", "/api/providers/custom-endpoints").get("endpoints", [])):
+            failed = True
+    except HermesError:
+        failed = Hermes.configured()
+    with owner().lock():
+        owner().atomic("registration.json", {"status": "unregister_failed" if failed else "not_registered"})
+
+
+def connection():
+    problem = None
+    try:
+        s = owner().stored()
+    except codex.Fault as e:
+        s, problem = {"status": "error"}, {"code": e.code, "message": str(e)}
+    status = "expired" if s.get("status") == "refreshing" else s.get("status", "not_connected")
+    out = {"contract": CONTRACT, "provider": "chatgpt", "name": "ChatGPT", "status": status,
+           "plan": None, "account": None, "usage": None, "error": None, "models": [], "chatIntegration": registration()}
+    if problem:
+        out["error"] = problem
+        return out
+    if status == "connected":
+        try:
+            out["models"] = owner().models()
+            out["plan"], out["usage"] = owner().usage()
+        except codex.Fault as e:
+            current = owner().stored().get("status", status)
+            out["status"] = ("error" if owner().unsaved is not None else "expired") if current == "refreshing" else current
+            out["error"] = {"code": e.code, "message": str(e)}
+    else:
+        out["error"] = {"code": "expired" if status == "expired" else "signed_out", "message": "Open ChatGPT and press Connect."}
     return out
 
 
-def forget():
-    with Cache.lock:
-        Cache.value = None
-
-
-def use_chatgpt(force: bool) -> bool:
-    """Point the agent's main model at ChatGPT. Without force, only when its current account doesn't work,
-    so connecting ChatGPT never silently moves an agent off a working account. True when switched."""
-    rows = Hermes.call("GET", "/api/model/options?include_unconfigured=true", timeout=90).get("providers") or []
-    current = next((p for p in rows if p.get("is_current")), None)
-    if current and current.get("slug") == CODEX:
-        return False
-    if not force and current and current.get("authenticated"):
-        return False
-    codex = next((p for p in rows if p.get("slug") == CODEX), {})
-    models = [m for m in (codex.get("featured_models") or []) + (codex.get("models") or []) if isinstance(m, str)]
-    if not models:
-        raise HermesError("ChatGPT is connected, but Hermes lists no ChatGPT models yet. Press Use ChatGPT in a minute.")
-    res = Hermes.call("POST", "/api/model/set", {"scope": "main", "provider": CODEX, "model": models[0],
-                                                 "confirm_expensive_model": True}, timeout=90)
-    if res.get("ok") is False:
-        raise HermesError(str(res.get("confirm_message") or res.get("detail") or "Hermes did not switch the model.")[:200])
-    return True
-
-
-class Login:
-    lock = threading.Lock()
-    session = ""     # Hermes' sign-in session id (never sent to the browser)
-    login_id = ""    # this page's handle for it
-
-
-def _end_login():
-    sid, Login.session, Login.login_id = Login.session, "", ""
-    if sid:
-        try:
-            Hermes.call("DELETE", f"/api/providers/oauth/sessions/{sid}")
-        except HermesError:
-            pass
-
-
-def connect() -> tuple[int, dict]:
-    with Login.lock:
-        _end_login()
-        try:
-            d = Hermes.call("POST", f"/api/providers/oauth/{CODEX}/start", {}, timeout=40)
-        except HermesError as e:
-            return 502, {"ok": False, "message": str(e)}
-        url, code, sid = str(d.get("verification_url") or ""), str(d.get("user_code") or ""), str(d.get("session_id") or "")
-        parts = urlsplit(url)
-        if not sid or parts.scheme != "https" or parts.hostname not in CHATGPT_HOSTS \
-                or not re.fullmatch(r"[A-Za-z0-9-]{4,24}", code):
-            Login.session = sid
-            _end_login()
-            return 502, {"ok": False, "message": "ChatGPT did not give a sign-in code. Try again in a minute."}
-        Login.session, Login.login_id = sid, secrets.token_urlsafe(16)
-        return 200, {"ok": True, "login_id": Login.login_id, "url": url, "code": code,
-                     "expires_in": int(d.get("expires_in") or 900)}
-
-
-def poll(login_id: str) -> tuple[int, dict]:
-    with Login.lock:
-        if not Login.login_id or not hmac.compare_digest(login_id.encode(), Login.login_id.encode()):
-            return 409, {"ok": False, "status": "expired", "message": "This sign-in expired. Press Connect again."}
-        sid = Login.session
+def account_row():
     try:
-        d = Hermes.call("GET", f"/api/providers/oauth/{CODEX}/poll/{sid}")
-    except HermesError as e:
-        with Login.lock:
-            Login.session = Login.login_id = ""
-        return 409, {"ok": False, "status": "expired", "message": "This sign-in expired. Press Connect again."
-                     if "not found" in str(e).lower() else str(e)}
-    status = d.get("status")
-    if status == "pending":
-        return 200, {"ok": True, "status": "pending"}
-    with Login.lock:
-        Login.session = Login.login_id = ""
-    forget()
-    if status != "approved":
-        return 400, {"ok": False, "status": status or "error",
-                     "message": "The code expired before it was approved. Press Connect again." if status == "expired"
-                     else "ChatGPT sign-in did not finish. Press Connect to try again."}
-    try:
-        switched = use_chatgpt(force=False)
-        message = ("Connected. Your agent now uses ChatGPT." if switched else
-                   "Connected. Your agent keeps its current account; press Use ChatGPT to switch.")
-    except HermesError as e:
-        message = f"Connected, but the agent was not switched: {e}"
-    return 200, {"ok": True, "status": "approved", "message": message}
+        s = owner().stored()
+    except codex.Fault as e:
+        return {"id": "chatgpt-subscription", "name": "ChatGPT subscription", "status": "error", "problem": str(e)}
+    if owner().unsaved is not None:
+        s = {"status": "connected"}
+    return {"id": "chatgpt-subscription", "name": "ChatGPT subscription", "status": "expired" if s.get("status") == "refreshing" else s.get("status", "not_connected"),
+            "detail": "Login not safely saved — repair app-data storage and press Test before restarting." if owner().unsaved is not None else "This app stores and renews your ChatGPT login. Hermes uses a box-only connection.",
+            "account": "", "signing_in": bool(owner().login), "integration": registration()}
 
 
-def cancel() -> tuple[int, dict]:
-    with Login.lock:
-        _end_login()
-    return 200, {"ok": True}
+# Only these fixed routes can reach the backend. Never an arbitrary forwarding proxy.
+GET_GATEWAY = {"/v1/models": "/codex/models?client_version=99.0.0",
+               "/v1/api/codex/usage": "/wham/usage",
+               "/v1/api/codex/rate-limit-reset-credits": "/wham/rate-limit-reset-credits"}
+POST_GATEWAY = {"/v1/responses": "/codex/responses", "/v1/responses/compact": "/codex/responses/compact",
+                "/v1/api/codex/rate-limit-reset-credits/consume": "/wham/rate-limit-reset-credits/consume"}
 
 
-def use() -> tuple[int, dict]:
-    if chatgpt_status().get("status") != "connected":
-        return 409, {"ok": False, "message": "Connect ChatGPT first."}
-    try:
-        switched = use_chatgpt(force=True)
-    except HermesError as e:
-        return 502, {"ok": False, "message": str(e)}
-    return 200, {"ok": True, "message": "Your agent now uses ChatGPT for new chats." if switched
-                 else "Your agent already uses ChatGPT."}
+# Node's built-in fetch (undici) always adds `Sec-Fetch-Mode: cors`, so that one header alone is a
+# box-local server caller (the Wizard Agent Service reading usage), not a browser. Browsers also send
+# Sec-Fetch-Site/Dest, which stay refused along with every proxy and cookie header.
+SERVER_FETCH_HEADERS = frozenset({"sec-fetch-mode"})
 
 
-def logout() -> tuple[int, dict]:
-    with Login.lock:
-        _end_login()
-    before = chatgpt_status()
-    try:
-        Hermes.call("DELETE", f"/api/providers/oauth/{CODEX}")
-    except HermesError as e:
-        return 502, {"ok": False, "message": str(e)}
-    forget()
-    status = chatgpt_status()
-    ok = status.get("status") == "not_connected"
-    message = "Disconnected." if ok else "Still connected."
-    if ok and before.get("in_use"):
-        message = "Disconnected. Your agent was using ChatGPT: connect it again, or pick another model."
-    return (200 if ok else 500), {"ok": ok, "message": message}
+def browser_or_proxy(key):
+    k = key.lower()
+    return (k in {"origin", "referer", "cookie", "tailscale-user-login", "forwarded", "x-real-ip", "via"}
+            or (k.startswith(("cf-", "x-forwarded-", "sec-fetch-")) and k not in SERVER_FETCH_HEADERS))
 
 
-def account_row() -> dict:
-    s = chatgpt_status()
-    row = {"id": "chatgpt-subscription", "name": "ChatGPT subscription", "kind": "subscription",
-           "detail": "Plus or Pro plan, signed in inside your Hermes Agent with ChatGPT's own device code.",
-           "status": s["status"], "in_use": bool(s.get("in_use")), "account": s.get("account") or "",
-           "model": s.get("model") or "", "signing_in": bool(Login.login_id)}
-    if s["status"] == "error":
-        row["problem"] = s.get("detail") or ""
-    return row
-
-
-def card(host: str) -> dict:
-    base = f"http://{host}" if host else f"http://wizard-chatgpt:{PORT}"
-    return {
-        "name": "wizard-chatgpt", "version": VERSION, "title": "ChatGPT",
-        "description": "Connect your ChatGPT subscription once. The sign-in runs inside your Hermes Agent, "
-                       "which keeps the tokens; this app only starts it and reports the status.",
-        "remotes": [],
-        "x-wizard": {
-            "kind": "system-agent-app",
-            "provides": ["ai-connection", "chatgpt-subscription"],
-            "contract": CONTRACT,
-            "skill": f"{base}/SKILL.md",
-            "connection_api": f"{base}/api/connection",
-            "agent_dashboard": "configured" if Hermes.configured() else "missing",
-            "usage": "from the agent's dashboard (Wizard OS plugin route) when present",
-            "ai_calls": False,
-            "secrets_exposed": False,
-        },
-    }
+def box_only(headers):
+    return not any(browser_or_proxy(k) for k in headers)
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "wizard-chatgpt"
     sys_version = ""
 
-    def log_message(self, format, *args):  # noqa: A002 - request lines only; never bodies
-        sys.stderr.write("%s %s\n" % (self.command, urlsplit(self.path).path))
+    def log_message(self, format, *args):
+        pass  # no query strings, headers, request bodies or upstream exception text in logs
 
-    def send(self, code: int, body: bytes, ctype: str):
+    def send(self, code, body, kind="application/json"):
         self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        # Framing: only this page itself and the Wizard shell origins the App Manager trusts (WIZARD_TRUSTED_ORIGINS),
-        # so the page opens inside a Wizard window and no other site can frame its Connect buttons.
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; "
-                         "img-src 'self' data:; connect-src 'self'; frame-ancestors " + FRAME_ANCESTORS +
-                         "; base-uri 'none'; form-action 'none'")
-        if FRAME_ANCESTORS == "'self'":
-            self.send_header("X-Frame-Options", "SAMEORIGIN")
+        for k, v in {"Content-Type": kind, "Content-Length": str(len(body)), "Cache-Control": "no-store",
+                     "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Connection": "close",
+                     "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors " + FRAME_ANCESTORS + "; base-uri 'none'; form-action 'none'"}.items():
+            self.send_header(k, v)
+        self.close_connection = True
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def json(self, code: int, data: dict):
-        self.send(code, json.dumps(data).encode(), "application/json")
+    def json(self, code, data):
+        self.send(code, json.dumps(data).encode())
 
-    def authorized(self, path: str) -> bool:
+    def authorized(self, path):
+        if path == "/api/connection" and self.headers.get("X-Wizard-Grant"):
+            try:
+                if inference.admit(self.headers):
+                    return True
+            except inference.Fault as e:
+                self.json(e.status, e.payload())
+                return False
         if not PASSWORD or path == "/health":
             return True
-        header = self.headers.get("Authorization", "")
-        if header.startswith("Basic "):
-            try:
-                _, _, given = base64.b64decode(header[6:]).decode().partition(":")
-                if hmac.compare_digest(given.encode(), PASSWORD.encode()):
-                    return True
-            except (ValueError, UnicodeDecodeError):
-                pass
+        try:
+            h = self.headers.get("Authorization", "")
+            if h.startswith("Basic ") and hmac.compare_digest(base64.b64decode(h[6:]).decode().partition(":")[2].encode(), PASSWORD.encode()):
+                return True
+        except (ValueError, UnicodeError):
+            pass
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="ChatGPT", charset="UTF-8"')
         self.send_header("Content-Length", "0")
         self.end_headers()
+        self.close_connection = True
         return False
 
-    def proxied(self) -> bool:
-        return any(k.lower() in PROXY_HEADERS or k.lower().startswith("cf-") for k in self.headers.keys())
+    def gateway(self, path):
+        if not box_only(self.headers):
+            return self.json(403, {"error": "Box-only endpoint."})
+        given = self.headers.get("Authorization", "")
+        if len(self.headers.get_all("Authorization", [])) != 1 or not hmac.compare_digest(given.encode(), ("Bearer " + owner().gateway_token()).encode()):
+            return self.json(401, {"error": "Local gateway bearer required."})
+        routes = GET_GATEWAY if self.command in ("GET", "HEAD") else POST_GATEWAY
+        if path not in routes:
+            return self.json(404, {"error": "Unsupported gateway route."})
+        if not GATEWAY_SLOTS.acquire(blocking=False):
+            return self.json(429, {"error": "Gateway capacity busy."})
+        started = False
+        try:
+            self.connection.settimeout(120)
+            body = inference.body(self, 16 * 1024 * 1024) if self.command == "POST" else None
+            if path == "/v1/responses":
+                assert body is not None
+                body.update(store=False, stream=True, instructions=body.get("instructions") or "You are a helpful assistant.")
+                for k in ("max_output_tokens", "max_tokens", "temperature", "top_p", "frequency_penalty", "presence_penalty", "truncation"):
+                    body.pop(k, None)
+            extra = {k: self.headers[k] for k in ("session_id", "x-client-request-id") if self.headers.get(k)}
+            with owner().open(self.command if self.command != "HEAD" else "GET", routes[path], body, extra) as r:
+                if path == "/v1/models":
+                    data = json.loads(r.read(codex.MAX_JSON))
+                    rows = [m for m in data.get("models", []) if isinstance(m, dict) and m.get("slug")]
+                    # Both shapes: OpenAI `data` for generic clients, and the account-scoped Codex `models`
+                    # rows that stock Hermes' native openai-codex reads. Without `models` Hermes falls back to
+                    # its offline list, which drops account-gated models such as GPT-6 Astra.
+                    return self.json(200, {"object": "list", "data": [{"id": m["slug"], "object": "model", "owned_by": "chatgpt"} for m in rows], "models": rows})
+                if path != "/v1/responses":
+                    raw = r.read(codex.MAX_JSON + 1)
+                    if len(raw) > codex.MAX_JSON:
+                        raise codex.Fault(message="ChatGPT response exceeded its limit.")
+                    return self.send(r.status, raw, "application/json")
+                self.send_response(r.status)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
+                # Quota headers only, never cookies, upstream identity or auth headers.
+                for k, v in r.headers.items():
+                    if k.lower().startswith(("x-codex-", "x-ratelimit-")) or k.lower() == "retry-after":
+                        self.send_header(k, v)
+                self.end_headers()
+                self.close_connection = True
+                started = True
+                if self.command != "HEAD":
+                    # SSE lines are flushed immediately, not buffered until completion.
+                    deadline, total = time.monotonic() + 600, 0
+                    while True:
+                        line = r.readline(4 * 1024 * 1024 + 1)
+                        if not line:
+                            break
+                        total += len(line)
+                        if len(line) > 4 * 1024 * 1024 or total > 64 * 1024 * 1024 or time.monotonic() > deadline:
+                            raise codex.Fault("limit", "ChatGPT stream exceeded its limit.", 429)
+                        self.wfile.write(line)
+                        self.wfile.flush()
+        except (codex.Fault, inference.Fault) as e:
+            if not started:
+                self.json(e.status, {"error": {"code": e.code, "message": str(e)}})
+            else:
+                self.wfile.write(("event: error\ndata: " + json.dumps({"type": "error", "code": e.code, "message": str(e)}) + "\n\n").encode())
+                self.wfile.flush()
+        except (OSError, ValueError):
+            if not started:
+                self.json(502, {"error": "ChatGPT gateway unavailable."})
+        finally:
+            GATEWAY_SLOTS.release()
 
     def do_HEAD(self):
         self.do_GET()
 
     def do_GET(self):
         path = urlsplit(self.path).path
+        if path.startswith("/v1/"):
+            return self.gateway(path)
         if not self.authorized(path):
             return
         if path == "/health":
             return self.json(200, {"status": "ok", "version": VERSION})
-        if path == "/.well-known/mcp/server-cards.json":
-            return self.json(200, card(self.headers.get("Host", "")))
         if path == "/api/connection":
-            if self.proxied():
-                return self.json(403, {"error": "box-only: call this from the server (app network or 127.0.0.1)"})
+            if not box_only(self.headers):
+                return self.json(403, {"error": "box-only endpoint"})
             return self.json(200, connection())
         if path == "/api/accounts":
             return self.json(200, {"accounts": [account_row()], "version": VERSION})
+        if path == "/.well-known/mcp/server-cards.json":
+            return self.json(200, {"name": "wizard-chatgpt", "version": VERSION, "title": "ChatGPT", "remotes": [],
+                        "x-wizard": {"provides": ["ai-connection", "chatgpt-subscription"], "contract": CONTRACT,
+                                     "ai_calls": True, "secrets_exposed": False}})
         if path in STATIC:
-            name, ctype = STATIC[path]
-            return self.send(200, (APP / "static" / name).read_bytes() if name != "SKILL.md" else
-                             (APP / "SKILL.md").read_bytes(), ctype)
+            name, kind = STATIC[path]
+            return self.send(200, ((APP if name == "SKILL.md" else APP / "static") / name).read_bytes(), kind)
         self.json(404, {"error": "not found"})
 
     def do_POST(self):
         path = urlsplit(self.path).path
+        if path.startswith("/v1/"):
+            return self.gateway(path)
+        if path == "/api/infer":
+            return inference.handle_owned(self, owner())
         if not self.authorized(path):
             return
         origin = self.headers.get("Origin")
-        if origin and urlsplit(origin).netloc != self.headers.get("Host"):
+        if (origin and urlsplit(origin).netloc != self.headers.get("Host")) or self.headers.get("Sec-Fetch-Site") == "cross-site":
             return self.json(403, {"ok": False, "message": "Cross-site request refused."})
-        if self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json":
-            return self.json(415, {"ok": False, "message": "JSON only."})
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > 4096:
-            return self.json(413, {"ok": False, "message": "Too large."})
+        # A same-origin JS-only header closes simple-form/opaque-Origin CSRF, including Basic auth.
+        if self.headers.get("X-Wizard-Request") != "1":
+            return self.json(403, {"ok": False, "message": "Use the ChatGPT page."})
         try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-            if not isinstance(body, dict):
-                raise ValueError
-        except ValueError:
-            return self.json(400, {"ok": False, "message": "Bad request."})
-        routes = {"/api/chatgpt/connect": connect, "/api/chatgpt/cancel": cancel,
-                  "/api/chatgpt/use": use, "/api/chatgpt/logout": logout}
-        if path == "/api/chatgpt/poll":
-            return self.json(*poll(str(body.get("login_id", ""))))
-        if path in routes:
-            return self.json(*routes[path]())
-        self.json(404, {"ok": False, "message": "not found"})
+            data = inference.body(self)
+            if path == "/api/chatgpt/connect":
+                return self.json(200, owner().connect())
+            if path == "/api/chatgpt/poll":
+                result = owner().poll(str(data.get("login_id", "")))
+                if result.get("status") == "approved":
+                    result["registration"] = reconcile()
+                return self.json(200, result)
+            if path == "/api/chatgpt/cancel":
+                owner().cancel()
+                return self.json(200, {"ok": True})
+            if path == "/api/chatgpt/test":
+                owner().access()
+                models = owner().models()
+                plan, usage = owner().usage()
+                return self.json(200, {"ok": True, "message": "ChatGPT connection verified.", "plan": plan, "usage": usage, "models": models, "registration": reconcile()})
+            if path == "/api/chatgpt/logout":
+                with REGISTRATION_LOCK:
+                    owner().disconnect()
+                    unregister()
+                return self.json(200, {"ok": True, "registration": registration(), "message": "Disconnected locally; Hermes cleanup needs retry." if registration() == "unregister_failed" else "Disconnected. In-flight replies may finish; new requests are disabled."})
+            self.json(404, {"ok": False, "message": "not found"})
+        except (codex.Fault, inference.Fault) as e:
+            self.json(e.status, {"ok": False, "status": e.code, "message": str(e)})
+        except (OSError, ValueError, TypeError):
+            self.json(503, {"ok": False, "message": "ChatGPT connection unavailable."})
 
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def server_bind(self):  # skip getfqdn(): it stalls without a resolver
+    def server_bind(self):
         socketserver.TCPServer.server_bind(self)
         self.server_name, self.server_port = str(self.server_address[0]), self.server_address[1]
 
 
 def main():
+    os.umask(0o077)
+    owner()
     server = Server((BIND, PORT), Handler)
     signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
-    print(f"ChatGPT {VERSION} on {BIND}:{PORT} (agent dashboard {'configured' if Hermes.configured() else 'missing'})",
-          flush=True)
+    if owner().stored().get("status") == "connected":
+        threading.Thread(target=reconcile, daemon=True).start()
+    print(f"ChatGPT {VERSION} on {BIND}:{PORT}", flush=True)
     try:
         server.serve_forever()
     finally:
-        with Login.lock:
-            _end_login()
+        owner().accounts.close()
         server.server_close()
 
 

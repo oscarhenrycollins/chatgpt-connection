@@ -13,7 +13,7 @@ services:
     mem_limit: 128m
     environment:
       WIZARD_APP: wizard-chatgpt
-      APP_VERSION: 0.2.4
+      APP_VERSION: 0.3.1
       FRONT_PORT: "8801"
       UPSTREAM_HOST: wizard-chatgpt-engine
       UPSTREAM_PORT: "8800"
@@ -250,9 +250,30 @@ services:
     x-runtipi:
       is_main: true
       internal_port: 8801
+  data-init:
+    image: python:3.12-alpine@sha256:1b668429b3511ab407d8e00648891631b0b1a4d7e15e3ca70f38ab5b91ad4ab4
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+    command:
+      - python3
+      - -c
+      - |
+        import os
+        from pathlib import Path
+        for p in (Path('/data'), Path('/data/claude')):
+            p.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chown(p, 1000, 1000)
+            os.chmod(p, 0o700)
   wizard-chatgpt-engine:
     # Built and published by wizard-app-store images/wizard-chatgpt at 254ee6f2 (wizard-app-store #32), Build ChatGPT run 40364246353.
     image: ghcr.io/humanitylabs-org/wizard-chatgpt:0.2.4@sha256:1c90102e819574b4c5e0c50f782b3f7cd0e998b53415407471bf59dabca27418
+    command: ["python3", "/app/pool_server.py"]
     user: "1000:1000"
     read_only: true
     cap_drop: [ALL]
@@ -263,19 +284,27 @@ services:
     cpus: 0.5
     environment:
       WIZARD_CHATGPT_PORT: "8800"
+      WIZARD_POOL_PROVIDER: chatgpt
+      WIZARD_POOL_BIND: 0.0.0.0
       WIZARD_POOL_PORT: "8800"
+      WIZARD_CHATGPT_AGENT_URL: http://wizard-chatgpt:8801/v1
+      APP_DATA_DIR: /data
       WIZARD_CHATGPT_PASSWORD: ${WIZARD_CHATGPT_PASSWORD:-}
       WIZARD_TRUSTED_ORIGINS: ${WIZARD_TRUSTED_ORIGINS:-}
       WIZARD_TRUSTED_HOSTS: ${WIZARD_TRUSTED_HOSTS:-}
-      # The agent whose own ChatGPT sign-ins this app lists, adds, reconnects and removes (Wizard OS plugin, stock
-      # `hermes auth`): the Hermes Agent app's dashboard by default; on alongside boxes the App Manager points it at
-      # the host agent's dashboard. Tokens never leave the agent.
+      # Dashboard is only for consumer registration/status. Sign-in stays in app-data.
       WIZARD_CHATGPT_HERMES_URL: ${WIZARD_CHATGPT_HERMES_URL:-http://hermes-agent:9119}
       WIZARD_CHATGPT_HERMES_USER: ${HERMES_DASHBOARD_BASIC_AUTH_USERNAME:-hermes}
       WIZARD_CHATGPT_HERMES_PASSWORD: ${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD:-}
     x-runtipi:
       # Joins the Runtipi main network so it can reach the Hermes Agent app by name.
       add_to_main_network: true
+    volumes:
+      - ${APP_SOURCE_DIR:?source package required}:/app:ro
+      - ${APP_DATA_DIR}/data:/data
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
 x-runtipi:
   schema_version: 2
   overrides: []

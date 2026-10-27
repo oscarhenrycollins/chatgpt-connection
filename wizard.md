@@ -5,7 +5,7 @@ name: ChatGPT
 type: external
 category: system
 tags: [security]
-version: 0.2.4
+version: 0.3.1
 summary: Connect one or more ChatGPT subscriptions; your agent uses them, and you see how much each has left.
 icon: icon.png
 license: MIT
@@ -14,6 +14,9 @@ runtime:
   kind: runtipi
   config: runtipi/config.json
   compose: runtipi/docker-compose.yml
+  package:
+    mode: source
+    root: .
 mcp:
   path: /mcp
   port: 8801
@@ -32,6 +35,6 @@ health: /health
 
 # ChatGPT
 
-Connect your ChatGPT Plus or Pro subscriptions on the ChatGPT page, and your agent uses them. Each sign-in is the agent's own ChatGPT device-code login (`hermes auth add openai-codex`, run by the agent's dashboard), so the agent keeps and renews the tokens and this app never sees them. ChatGPT asks you once to turn on **Settings → Security → Device code sign-in for Codex**; the page says so before it shows the code.
+Sign in with your subscription in this connection app. Add as many subscriptions as you need on one accounts page. Sign-in and renewal live in private app-data, not your agent. The page reports provider status separately from whether the agent can use it, so an alongside box cannot mistake an unused local login for a working agent connection.
 
-This is a Wizard AI connection app (`wizard.ai-connection/2`): `GET /api/connection` reports the overall status, plan and usage plus one row per subscription, `GET /api/accounts` lists them, and the MCP tool `connection_status` gives agents the same answer. When the app can't reach the agent it says so (with the agent address) instead of showing an empty list. Engine source: `humanitylabs-org/wizard-app-store` `images/wizard-chatgpt`; the page is the same one the Claude app uses.
+See `docs/APP_OWNED_LOGIN.md` for the design, onboarding integration, exclusive migration requirements, and evidence boundaries. Existing agent-owned subscriptions are not silently copied or deleted.
