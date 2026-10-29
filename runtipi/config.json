@@ -11,7 +11,7 @@
   ],
   "description": "Connect your ChatGPT Plus or Pro subscriptions to your Wizard server. Each sign-in is your agent's own ChatGPT login (a short code you paste on ChatGPT; turn on Device code sign-in for Codex in ChatGPT Settings, Security first), so your agent keeps and renews it and this app never sees a token. The app shows each subscription with how much of its usage is left and reports them to Wizard's home screen. Works with the Hermes Agent app or your own Hermes on this server.",
   "tipi_version": 1,
-  "version": "0.2.9",
+  "version": "0.2.10",
   "source": "https://github.com/oscarhenrycollins/chatgpt-connection",
   "exposable": false,
   "supported_architectures": [
@@ -19,7 +19,7 @@
     "arm64"
   ],
   "created_at": 1792088845863,
-  "updated_at": 1793287842584,
+  "updated_at": 1793311641444,
   "dynamic_config": true,
   "min_tipi_version": "4.8.0",
   "uid": 1000,
