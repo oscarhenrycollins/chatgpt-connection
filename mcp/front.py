@@ -26,6 +26,66 @@ MAX_BODY = 1 << 20
 TOOLS = {}
 REQUEST = contextvars.ContextVar("request", default={})  # headers of the current /mcp call
 
+# Browser boundary (default-off, WIZARD_BROWSER_BOUNDARY=1): this listener is reachable straight from the private
+# network (Tailscale Serve publishes the app's path and port to it directly, not through the shell), so network owner
+# identity is not authority here. The accounts routes (WIZARD_GUARDED_PATHS, prefixes) then answer only the Wizard
+# Agent Service adapter: a box-local request (no browser or proxy headers) that carries this installation's app
+# credential (X-Wizard-App-Credential, minted by the App Manager, never given to a browser). /api/connection and
+# /api/infer keep their own grants (Agent Service usage reader, connection router) and are not affected.
+# Preflights are refused on guarded paths, and no CORS header is ever sent. wizard-os spec/browser-trust-shell-intents.
+BOUNDARY = os.environ.get("WIZARD_BROWSER_BOUNDARY", "0") == "1"
+APP_CREDENTIAL = os.environ.get("WIZARD_APP_CREDENTIAL", "").strip()
+GUARDED = tuple(p.strip() for p in os.environ.get("WIZARD_GUARDED_PATHS", "").split(",") if p.strip())
+# The optional page password (a box with one set): the gated adapter call is let through to the engine with it, since
+# the adapter never holds the owner's password. Never forwarded from a request.
+PAGE_PASSWORD = os.environ.get("WIZARD_PAGE_PASSWORD", "")
+CREDENTIAL_HEADER = "x-wizard-app-credential"
+BROWSER_HEADERS = ("origin", "cookie", "referer", "sec-fetch-site", "sec-fetch-dest", "sec-fetch-user", "sec-fetch-mode")
+NETWORK_HEADERS = ("tailscale-user-login", "tailscale-user-name", "x-forwarded-for", "x-forwarded-host", "forwarded",
+                   "x-real-ip", "via")
+
+
+def boundary_config_error():
+    """Why the boundary cannot start, or "" (fail closed: never run unguarded with the flag on)."""
+    if not BOUNDARY:
+        return ""
+    if len(APP_CREDENTIAL) != 64 or any(c not in "0123456789abcdef" for c in APP_CREDENTIAL):
+        return "WIZARD_BROWSER_BOUNDARY=1 needs WIZARD_APP_CREDENTIAL (64 lowercase hex, from the App Manager)"
+    if not GUARDED or not all(p.startswith("/") and p.endswith("/") for p in GUARDED):
+        return "WIZARD_BROWSER_BOUNDARY=1 needs WIZARD_GUARDED_PATHS (comma-separated /prefix/ paths)"
+    return ""
+
+
+def guarded(path):
+    return any(path == p.rstrip("/") or path.startswith(p) for p in GUARDED)
+
+
+def listener_gate(method, path, raw_headers):
+    """(status, error) when the boundary refuses this request, else None. raw_headers: [(lower name, value)]."""
+    if not BOUNDARY or not guarded(path):
+        return None
+    if method == "OPTIONS":
+        return 403, "preflight_refused"
+    names = [k for k, _ in raw_headers]
+    if any(k in BROWSER_HEADERS for k in names):
+        return 403, "browser_request_refused"       # frames and pages, even with a credential they should never hold
+    if any(k in NETWORK_HEADERS or k.startswith("cf-") for k in names):
+        return 403, "network_identity_refused"      # an owner login from the network is not app authority
+    supplied = [v for k, v in raw_headers if k == CREDENTIAL_HEADER]
+    import hmac
+    if len(supplied) != 1 or not hmac.compare_digest(supplied[0].strip().encode("latin-1"), APP_CREDENTIAL.encode()):
+        return 401, "adapter_credential_required"
+    return None
+
+
+def gated_head_lines(lines):
+    """Request head lines for an admitted adapter call: the credential and any Authorization are dropped; the page
+    password (if this box has one) is added so the engine's own page check passes."""
+    out = [l for l in lines if not l.lower().startswith((CREDENTIAL_HEADER + ":", "authorization:"))]
+    if PAGE_PASSWORD:
+        out.insert(1, "Authorization: Basic " + base64.b64encode(("wizard:" + PAGE_PASSWORD).encode()).decode())
+    return out
+
 
 def tool(name, description, props=None, required=()):
     def deco(fn):
@@ -154,6 +214,14 @@ async def handle(reader, writer):
     path = parts[1].split("?", 1)[0] if len(parts) >= 3 else ""
     if path == MCP_PATH:
         return await mcp(reader, writer, parts[0], rest)
+    admitted = False
+    if BOUNDARY:
+        raw = [(k.strip().lower(), v.strip()) for k, _, v in
+               (l.partition(":") for l in rest.decode("latin-1").split("\r\n") if ":" in l)]
+        refused = listener_gate(parts[0], path, raw)
+        if refused:
+            return await respond(writer, refused[0], {"error": refused[1]}, "Cache-Control: no-store\r\n")
+        admitted = guarded(path)
     if not UP_HOST:
         return await respond(writer, 404, {"error": "not found"})
     try:
@@ -163,6 +231,9 @@ async def handle(reader, writer):
     # One request per proxied connection (unless it is an upgrade such as a WebSocket), so a
     # later /mcp request can never ride an upstream keep-alive connection.
     lines = head.decode("latin-1").split("\r\n")
+    if admitted:
+        lines = gated_head_lines(lines)
+        head = "\r\n".join(lines).encode("latin-1")
     if not any(l.lower().startswith("upgrade:") for l in lines):
         lines = [l for l in lines if l and not l.lower().startswith(("connection:", "keep-alive:"))]
         head = ("\r\n".join(lines) + "\r\nConnection: close\r\n\r\n").encode("latin-1")
@@ -172,6 +243,9 @@ async def handle(reader, writer):
 
 
 async def main():
+    problem = boundary_config_error()
+    if problem:
+        raise SystemExit(problem)
     srv = await asyncio.start_server(handle, "0.0.0.0", PORT, limit=MAX_HEAD)
     async with srv:
         await srv.serve_forever()
