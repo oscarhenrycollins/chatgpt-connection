@@ -42,11 +42,11 @@
     },
     {
       "type": "password",
-      "label": "Hermes Agent dashboard password",
+      "label": "Hermes Agent dashboard password or key",
       "env_variable": "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
       "required": true,
       "min": 16,
-      "hint": "Filled in automatically from your Hermes Agent app (the same dashboard password). ChatGPT signs in inside Hermes, so this app never sees that token."
+      "hint": "Filled in automatically from your Hermes Agent app (the agent's dashboard password; on an alongside box with the browser boundary on, this app's own key for the Wizard front instead, never the password). ChatGPT signs in inside Hermes, so this app never sees that token."
     },
     {
       "type": "text",
