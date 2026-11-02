@@ -353,6 +353,9 @@ services:
       # the host agent's dashboard. Tokens never leave the agent.
       WIZARD_CHATGPT_HERMES_URL: ${WIZARD_CHATGPT_HERMES_URL:-http://hermes-agent:9119}
       WIZARD_CHATGPT_HERMES_USER: ${HERMES_DASHBOARD_BASIC_AUTH_USERNAME:-hermes}
+      # Alongside boxes with the browser boundary on (wizard-os issue 386): the App Manager fills this with the app's OWN
+      # per-app key for the Wizard front of the host dashboard, never the dashboard password. The engine's login is
+      # unchanged; the front answers it and allows only this app's reviewed dashboard paths.
       WIZARD_CHATGPT_HERMES_PASSWORD: ${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD:-}
     x-runtipi:
       # Joins the Runtipi main network so it can reach the Hermes Agent app by name.
