@@ -40,7 +40,7 @@ GUARDED = tuple(p.strip() for p in os.environ.get("WIZARD_GUARDED_PATHS", "").sp
 # the adapter never holds the owner's password. Never forwarded from a request.
 PAGE_PASSWORD = os.environ.get("WIZARD_PAGE_PASSWORD", "")
 CREDENTIAL_HEADER = "x-wizard-app-credential"
-BROWSER_HEADERS = ("origin", "cookie", "referer", "sec-fetch-site", "sec-fetch-dest", "sec-fetch-user", "sec-fetch-mode")
+BROWSER_HEADERS = ("origin", "cookie", "referer", "sec-fetch-site", "sec-fetch-dest", "sec-fetch-user")
 NETWORK_HEADERS = ("tailscale-user-login", "tailscale-user-name", "x-forwarded-for", "x-forwarded-host", "forwarded",
                    "x-real-ip", "via")
 

@@ -101,8 +101,9 @@ class ListenerGate(unittest.TestCase):
 
     def test_adapter_with_credential_reaches_engine_without_it(self):
         for path in ("/api/accounts", "/api/operations", "/api/operations/" + "a" * 32):
+            # Node's fetch (the Agent Service) always adds Sec-Fetch-Mode: cors but never Site/Dest/Origin.
             status, _ = self.on.req("GET" if path != "/api/operations" else "POST", path,
-                                    [("X-Wizard-App-Credential", self.cred), ("Content-Type", "application/json"),
+                                    [("X-Wizard-App-Credential", self.cred), ("Content-Type", "application/json"), ("Sec-Fetch-Mode", "cors"),
                                      ("Authorization", "Basic c3RvbGVuOnN0b2xlbg==")], b"{}" if path == "/api/operations" else None)
             self.assertEqual(status, 200, path)
         self.assertEqual(len(SEEN), 3)
